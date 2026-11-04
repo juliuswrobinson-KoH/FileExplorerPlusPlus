@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="FileExplorer%2B%2B%20Logo.png" alt="FileExplorer++ logo" width="320">
+</p>
+
 # ExplorerPlusPlus
 
 Versatile File Explorer with Custom Filesystem Support and extensible features.
