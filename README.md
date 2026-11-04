@@ -1,4 +1,6 @@
-# Explorer++
+# ExplorerPlusPlus
+
+Versatile File Explorer with Custom Filesystem Support and extensible features.
 
 A WinUI 3, dual-pane file manager for Windows. The left and right panes have independent tabs and locations, with a folder tree and quick-access shortcuts alongside them.
 
