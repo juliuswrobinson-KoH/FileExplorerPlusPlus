@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>UI</RootNamespace>
+    <AssemblyName>ExplorerPlusPlus</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <UseWinUI>true</UseWinUI>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableCoreMrtTooling>false</EnableCoreMrtTooling>
+    <ApplicationIcon>Assets\FileExplorerIcon.ico</ApplicationIcon>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Update="Assets\FileExplorerIcon.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="HelixToolkit.SharpDX.Assimp" Version="3.1.2" />
+    <PackageReference Include="HelixToolkit.WinUI.SharpDX" Version="3.1.2" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <PackageReference Include="SixLabors.ImageSharp" Version="4.1.3" />
+  </ItemGroup>
+</Project>

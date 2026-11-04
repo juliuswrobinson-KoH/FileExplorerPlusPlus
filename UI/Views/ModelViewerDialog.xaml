@@ -1,0 +1,24 @@
+<ContentDialog
+    x:Class="UI.Views.ModelViewerDialog"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:hx="using:HelixToolkit.WinUI.SharpDX"
+    PrimaryButtonText="Reset camera"
+    CloseButtonText="Close">
+    <Grid Width="1000" Height="650">
+        <hx:Viewport3DX x:Name="Viewport"
+                        BackgroundColor="#20252D"
+                        CameraMode="Inspect"
+                        IsViewCubeEdgeClicksEnabled="True"
+                        FixedRotationPointEnabled="True">
+            <hx:AmbientLight3D Color="#707070"/>
+            <hx:DirectionalLight3D Direction="-1,-1,-1" Color="White"/>
+            <hx:Element3DPresenter x:Name="ScenePresenter"/>
+        </hx:Viewport3DX>
+        <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="12"
+                Background="#CC171A20" CornerRadius="4" Padding="8">
+            <TextBlock Text="Drag to orbit · scroll to zoom · right-drag to pan"
+                       FontSize="11" Foreground="White"/>
+        </Border>
+    </Grid>
+</ContentDialog>
