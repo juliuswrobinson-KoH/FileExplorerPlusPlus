@@ -5,46 +5,53 @@
     xmlns:converters="using:UI.Converters"
     Title="Explorer++">
     <Grid x:Name="Root" Background="Transparent" IsTabStop="True">
+        <!-- Shared item templates and layout panels for list, details, and thumbnail views. -->
         <Grid.Resources>
             <converters:FontFamilyConverter x:Key="FontFamilyConverter"/>
             <converters:FontColorConverter x:Key="FontColorConverter"/>
+            <Style x:Key="CompactEntryContainerStyle" TargetType="ListViewItem"
+                   BasedOn="{StaticResource DefaultListViewItemStyle}">
+                <Setter Property="MinHeight" Value="0"/>
+                <Setter Property="Padding" Value="0"/>
+                <Setter Property="Margin" Value="0"/>
+            </Style>
             <DataTemplate x:Key="DetailEntryTemplate">
-                <Grid Padding="8,5" ColumnSpacing="10">
+                <Grid Padding="0,2" ColumnSpacing="5" Margin="2">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="24"/>
+                        <ColumnDefinition Width="40"/>
                         <ColumnDefinition Width="2*"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="100"/>
                         <ColumnDefinition Width="150"/>
                     </Grid.ColumnDefinitions>
-                    <Grid Width="20" Height="20" VerticalAlignment="Center">
-                        <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF"/>
+                    <Grid Grid.Column="0" Width="{Binding FileIconSize}" Height="{Binding FileIconSize}" VerticalAlignment="Center">
+                        <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF" FontSize="{Binding FileIconSize}" Visibility="{Binding IconFallbackVisibility}"/>
                         <Image Source="{Binding IconImage}" Stretch="Uniform"/>
                     </Grid>
                     <TextBlock Grid.Column="1" Text="{Binding Name}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="{Binding ItemFontColor, Converter={StaticResource FontColorConverter}}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="2" Text="{Binding Type}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="#AAB4C2" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                     <TextBlock Grid.Column="3" Text="{Binding Size}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="#AAB4C2" HorizontalAlignment="Right" VerticalAlignment="Center"/>
-                    <TextBlock Grid.Column="4" Text="{Binding Modified}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="#AAB4C2" Margin="12,0,0,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
+                    <TextBlock Grid.Column="4" Text="{Binding Modified}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="#AAB4C2" Margin="6,0,0,0" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                 </Grid>
             </DataTemplate>
             <DataTemplate x:Key="ListEntryTemplate">
-                <StackPanel Orientation="Horizontal" Spacing="8" Padding="6,3">
-                    <Grid Width="20" Height="20">
-                        <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF" FontSize="16"/>
+                <StackPanel Orientation="Horizontal" Spacing="4" Padding="10,4">
+                    <Grid Width="{Binding FileIconSize}" Height="{Binding FileIconSize}">
+                        <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF" FontSize="{Binding FileIconSize}" Visibility="{Binding IconFallbackVisibility}"/>
                         <Image Source="{Binding IconImage}" Stretch="Uniform"/>
                     </Grid>
                     <TextBlock Text="{Binding Name}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="{Binding ItemFontColor, Converter={StaticResource FontColorConverter}}" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/>
                 </StackPanel>
             </DataTemplate>
             <DataTemplate x:Key="ThumbnailEntryTemplate">
-                <Grid Width="{Binding TileSize}" Height="{Binding TileSize}" Margin="5">
+                <Grid Width="{Binding TileSize}" Height="{Binding TileSize}" Margin="4,2.5">
                     <Grid.RowDefinitions>
                         <RowDefinition Height="*"/>
                         <RowDefinition Height="Auto"/>
                         <RowDefinition Height="Auto"/>
                     </Grid.RowDefinitions>
-                    <Grid Padding="4">
-                        <FontIcon Glyph="{Binding Icon}" FontSize="36" Foreground="#83BFFF"
+                    <Grid Padding="10,2">
+                        <FontIcon Glyph="{Binding Icon}" FontSize="{Binding FileIconSize}" Foreground="#83BFFF"
                                   HorizontalAlignment="Center" VerticalAlignment="Center"
                                   Visibility="{Binding PreviewIconVisibility}"/>
                         <Image Source="{Binding PreviewImage}" Stretch="Uniform"
@@ -53,7 +60,7 @@
                                    Foreground="#DDE5EF" TextWrapping="Wrap" TextTrimming="CharacterEllipsis"
                                    Visibility="{Binding PreviewTextVisibility}"/>
                     </Grid>
-                    <TextBlock Grid.Row="1" Text="{Binding Name}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="{Binding ItemFontColor, Converter={StaticResource FontColorConverter}}" Margin="3,4,3,0"
+                    <TextBlock Grid.Row="1" Text="{Binding Name}" FontFamily="{Binding ItemFontFamily, Converter={StaticResource FontFamilyConverter}}" FontSize="{Binding ItemFontSize}" Foreground="{Binding ItemFontColor, Converter={StaticResource FontColorConverter}}" Margin="1.5,2,1.5,0"
                                TextWrapping="Wrap" TextTrimming="CharacterEllipsis"
                                HorizontalAlignment="Center" TextAlignment="Center"/>
                     <TextBlock Grid.Row="2" Text="{Binding Size}" FontSize="9" Foreground="#AAB4C2"
@@ -67,6 +74,8 @@
                 <ItemsWrapGrid Orientation="Horizontal"/>
             </ItemsPanelTemplate>
         </Grid.Resources>
+
+        <!-- Main window rows: title bar, drive summary, toolbar, explorer area, and status bar. -->
         <Grid.RowDefinitions>
             <RowDefinition Height="32"/>
             <RowDefinition Height="96"/>
@@ -80,11 +89,13 @@
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
 
+        <!-- Custom title bar and drag region. -->
         <Grid x:Name="TitleBarDragRegion" Grid.Row="0" Grid.ColumnSpan="3" Background="Transparent">
             <TextBlock Text="Explorer++" Margin="12,0,0,0" VerticalAlignment="Center"
                        FontSize="12" Foreground="#E8EDF4"/>
         </Grid>
 
+        <!-- Physical drive and partition summary, plus view-mode controls. -->
         <Border Grid.Row="1" Grid.ColumnSpan="3" Background="Transparent"
                 BorderBrush="#303640" BorderThickness="0,0,0,1">
             <Grid Padding="12,7">
@@ -102,7 +113,12 @@
                         <RowDefinition Height="22"/>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
-                    <TextBlock Text="PHYSICAL DRIVES &amp; PARTITIONS" FontSize="10" FontWeight="Bold" Foreground="#AAB4C2"/>
+                    <Grid>
+                        <TextBlock Text="DRIVES &amp; NETWORK LOCATIONS" FontSize="10" FontWeight="Bold" Foreground="#AAB4C2"/>
+                        <Button Content="Add location" HorizontalAlignment="Right" VerticalAlignment="Top"
+                                Padding="8,1" MinHeight="20" Click="AddLocation_Click"
+                                ToolTipService.ToolTip="Map a network drive or connect to FTP/SFTP"/>
+                    </Grid>
                     <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
                         <ItemsControl x:Name="DriveGroups" ItemsSource="{x:Bind PhysicalDrives}">
                             <ItemsControl.ItemsPanel>
@@ -112,42 +128,34 @@
                             </ItemsControl.ItemsPanel>
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate>
-                                    <Border Background="#20252D" BorderBrush="#343B46" BorderThickness="1" CornerRadius="5" Padding="8,4"
-                                            RightTapped="DriveContext_RightTapped">
-                                        <StackPanel Orientation="Horizontal" Spacing="8">
-                                            <StackPanel VerticalAlignment="Center" Width="150">
-                                                <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="SemiBold"/>
-                                                <TextBlock Text="{Binding Model}" FontSize="10" Foreground="#AAB4C2"
-                                                           TextTrimming="CharacterEllipsis" ToolTipService.ToolTip="{Binding Model}"/>
-                                                <TextBlock Text="{Binding SizeText}" FontSize="9" Foreground="#AAB4C2"/>
-                                            </StackPanel>
-                                            <ItemsControl ItemsSource="{Binding Partitions}">
-                                                <ItemsControl.ItemsPanel>
-                                                    <ItemsPanelTemplate>
-                                                        <StackPanel Orientation="Horizontal" Spacing="4"/>
-                                                    </ItemsPanelTemplate>
-                                                </ItemsControl.ItemsPanel>
-                                                <ItemsControl.ItemTemplate>
-                                                    <DataTemplate>
-                                                        <Button Click="DrivePartition_Click" Tag="{Binding}" IsEnabled="{Binding HasPath}"
-                                                                RightTapped="DriveContext_RightTapped">
-                                                            <StackPanel Orientation="Horizontal" Spacing="6" MaxWidth="190">
-                                                                <Grid Width="26" Height="26">
-                                                                    <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF" FontSize="18"/>
-                                                                    <Image Source="{Binding IconImage}" Stretch="Uniform"/>
-                                                                </Grid>
-                                                                <StackPanel VerticalAlignment="Center">
-                                                                    <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="SemiBold"
+                                    <Border Background="#20252D" BorderBrush="#343B46" BorderThickness="1" CornerRadius="5" Padding="4,4"
+                                            RightTapped="DriveContext_RightTapped" ToolTipService.ToolTip="{Binding Model}">
+                                        <ItemsControl ItemsSource="{Binding Partitions}">
+                                            <ItemsControl.ItemsPanel>
+                                                <ItemsPanelTemplate>
+                                                    <StackPanel Orientation="Horizontal" Spacing="6"/>
+                                                </ItemsPanelTemplate>
+                                            </ItemsControl.ItemsPanel>
+                                            <ItemsControl.ItemTemplate>
+                                                <DataTemplate>
+                                                    <Button Click="DrivePartition_Click" Tag="{Binding}" IsEnabled="{Binding HasPath}"
+                                                                RightTapped="DriveContext_RightTapped" Padding="4,4">
+                                                        <StackPanel Orientation="Horizontal" Spacing="4" MaxWidth="190">
+                                                            <Grid Width="{Binding FileIconSize}" Height="{Binding FileIconSize}">
+                                                                <FontIcon Glyph="{Binding Icon}" Foreground="#83BFFF" FontSize="{Binding FileIconSize}" Visibility="{Binding IconFallbackVisibility}"/>
+                                                                <Image Source="{Binding IconImage}" Stretch="Uniform"/>
+                                                            </Grid>
+                                                            <StackPanel VerticalAlignment="Center">
+                                                                <TextBlock Text="{Binding Name}" FontSize="12" FontWeight="SemiBold"
                                                                                TextTrimming="CharacterEllipsis"/>
-                                                                    <TextBlock Text="{Binding Details}" FontSize="10" Foreground="#AAB4C2"
+                                                                <TextBlock Text="{Binding Details}" FontSize="10" Foreground="#AAB4C2"
                                                                                TextTrimming="CharacterEllipsis"/>
-                                                                </StackPanel>
                                                             </StackPanel>
-                                                        </Button>
-                                                    </DataTemplate>
-                                                </ItemsControl.ItemTemplate>
-                                            </ItemsControl>
-                                        </StackPanel>
+                                                        </StackPanel>
+                                                    </Button>
+                                                </DataTemplate>
+                                            </ItemsControl.ItemTemplate>
+                                        </ItemsControl>
                                     </Border>
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
@@ -190,6 +198,7 @@
             </Grid>
         </Border>
 
+        <!-- Navigation toolbar, settings shortcut, and current-folder filter. -->
         <Border Grid.Row="2" Grid.ColumnSpan="3" Background="Transparent"
                 BorderBrush="#303640" BorderThickness="0,0,0,1">
             <Grid>
@@ -197,18 +206,20 @@
                     <ColumnDefinition Width="*"/>
                     <ColumnDefinition Width="Auto"/>
                 </Grid.ColumnDefinitions>
-            <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Padding="4,0" Spacing="2">
-                <Button Content="&#xE72B;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Back" Click="BackButton_Click"/>
-                <Button Content="&#xE72A;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Forward" Click="ForwardButton_Click"/>
-                <Button Content="&#xE74A;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Up" Click="UpButton_Click"/>
-                <Button Content="&#xE72C;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Refresh" Click="RefreshButton_Click"/>
-                <Border Width="1" Height="22" Background="#3A414C" Margin="8,0"/>
-                <Border Width="1" Height="22" Background="#3A414C" Margin="4,0"/>
-                <Button Content="&#xE710;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="New item"
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Padding="4,0" Spacing="2">
+                    <Button Content="&#xE72B;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Back" Click="BackButton_Click"/>
+                    <Button Content="&#xE72A;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Forward" Click="ForwardButton_Click"/>
+                    <Button Content="&#xE74A;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Up" Click="UpButton_Click"/>
+                    <Button Content="&#xE72C;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Refresh" Click="RefreshButton_Click"/>
+                    <Border Width="1" Height="22" Background="#3A414C" Margin="8,0"/>
+                    <Border Width="1" Height="22" Background="#3A414C" Margin="4,0"/>
+                    <Button Content="&#xE710;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="New item"
                         AutomationProperties.Name="New item" Click="NewItemButton_Click"/>
-                <Button Content="&#xE713;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Settings"
+                    <Button Content="&#xF0E3;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Clipboard history"
+                        AutomationProperties.Name="Clipboard history" Click="ClipboardHistoryButton_Click"/>
+                    <Button Content="&#xE713;" FontFamily="Segoe MDL2 Assets" ToolTipService.ToolTip="Settings"
                         AutomationProperties.Name="Settings" Click="SettingsButton_Click"/>
-            </StackPanel>
+                </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center" HorizontalAlignment="Right"
                             Padding="4,0" Spacing="2">
                     <TextBox x:Name="SearchBox" Width="260" Height="28"
@@ -218,39 +229,28 @@
             </Grid>
         </Border>
 
+        <!-- Unified navigation tree with Quick access and This PC roots. -->
         <Border x:Name="Sidebar" Grid.Row="3" Grid.Column="0" Background="Transparent"
                 BorderBrush="#303640" BorderThickness="0,0,1,0">
             <Grid Padding="10">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
-                    <RowDefinition Height="Auto"/>
                     <RowDefinition Height="*"/>
                 </Grid.RowDefinitions>
-                <TextBlock Text="QUICK ACCESS" FontSize="11" FontWeight="Bold" Foreground="#AAB4C2" Margin="8,6,0,8"/>
-                <ListView x:Name="QuickAccessList" Grid.Row="1" SelectionMode="None" IsItemClickEnabled="True"
-                          ItemClick="QuickAccessList_ItemClick" RightTapped="QuickAccessList_RightTapped" MaxHeight="220">
-                    <ListView.ItemTemplate>
-                        <DataTemplate>
-                            <StackPanel Orientation="Horizontal" Spacing="10" Padding="4,6">
-                                <FontIcon Glyph="{Binding Icon}" FontSize="15" Foreground="#8EC5FF"/>
-                                <TextBlock Text="{Binding Name}" VerticalAlignment="Center"/>
-                            </StackPanel>
-                        </DataTemplate>
-                    </ListView.ItemTemplate>
-                </ListView>
-                <Grid Grid.Row="2" Margin="0,14,0,0">
+                <TextBlock Text="NAVIGATION" FontSize="11" FontWeight="Bold" Foreground="#AAB4C2" Margin="8,6,0,8"/>
+                <Grid Grid.Row="1">
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
                         <RowDefinition Height="*"/>
                     </Grid.RowDefinitions>
-                    <TextBlock Text="FOLDERS" FontSize="11" FontWeight="Bold" Foreground="#AAB4C2" Margin="8,0,0,8"/>
-                    <TreeView x:Name="FolderTree" Grid.Row="1" ItemInvoked="FolderTree_ItemInvoked"
+                    <TreeView x:Name="FolderTree" ItemInvoked="FolderTree_ItemInvoked"
                               Expanding="FolderTree_Expanding">
                         <TreeView.ItemTemplate>
                             <DataTemplate>
-                                <StackPanel Orientation="Horizontal" Spacing="8">
-                                    <Grid Width="18" Height="18">
-                                        <FontIcon Glyph="{Binding Content.Icon}" FontSize="14" Foreground="#83BFFF"/>
+                                <StackPanel Orientation="Horizontal" Spacing="8" RightTapped="FolderTreeItem_RightTapped">
+                                    <Grid Width="{Binding Content.FileIconSize}" Height="{Binding Content.FileIconSize}">
+                                        <FontIcon Glyph="{Binding Content.Icon}" FontSize="{Binding Content.FileIconSize}"
+                                                  Foreground="{Binding Content.IconForeground, Converter={StaticResource FontColorConverter}}"
+                                                  Visibility="{Binding Content.IconFallbackVisibility}"/>
                                         <Image Source="{Binding Content.IconImage}" Stretch="Uniform"/>
                                     </Grid>
                                     <TextBlock Text="{Binding Content.Name}" TextTrimming="CharacterEllipsis"/>
@@ -262,59 +262,84 @@
             </Grid>
         </Border>
 
+        <!-- Resizable divider between the navigation tree and file panes. -->
         <Border Grid.Row="3" Grid.Column="1" Background="#303640" ToolTipService.ToolTip="Drag to resize the folder tree"
                 PointerPressed="Splitter_PointerPressed" PointerMoved="Splitter_PointerMoved"
                 PointerReleased="Splitter_PointerReleased" PointerCanceled="Splitter_PointerCanceled"
                 PointerCaptureLost="Splitter_PointerCaptureLost" Tag="Sidebar"/>
 
+        <!-- Dual-pane explorer area. Each pane has tabs, breadcrumbs, and a file list. -->
         <Grid x:Name="PanesGrid" Grid.Row="3" Grid.Column="2">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*"/>
                 <ColumnDefinition Width="8"/>
                 <ColumnDefinition Width="*"/>
             </Grid.ColumnDefinitions>
+            <!-- Left explorer pane. -->
             <Border x:Name="LeftPaneBorder" Grid.Column="0" Margin="5" BorderThickness="2"
                     BorderBrush="#4C5664" CornerRadius="5" PointerPressed="PaneBorder_PointerPressed">
-              <Grid x:Name="LeftPanel" Margin="3">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="38"/>
-                    <RowDefinition Height="36"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                <Grid Grid.Row="0" Background="Transparent" DoubleTapped="TabStrip_DoubleTapped" Tag="Left">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel x:Name="LeftTabs" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center"/>
-                    <Button Grid.Column="1" Content="&#xE700;" FontFamily="Segoe MDL2 Assets"
-                            ToolTipService.ToolTip="Folder options" AutomationProperties.Name="Folder options"
+                <Grid x:Name="LeftPanel" Margin="3">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="38"/>
+                        <RowDefinition Height="36"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0" Background="Transparent" DoubleTapped="TabStrip_DoubleTapped" Tag="Left">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="32"/>
+                            <ColumnDefinition Width="32"/>
+                            <ColumnDefinition Width="32"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel x:Name="LeftTabs" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center"/>
+                        <Button Grid.Column="1" Content="&#xE970;" 
+                                FontFamily="Segoe MDL2 Assets" Padding="0"
+                            Click="CopyPanePathToOther_Click" Tag="Left"
+                            ToolTipService.ToolTip="Show in right panel"
+                            AutomationProperties.Name="Show in right panel"/>
+                        <Button Grid.Column="2" Content="&#xF1CC;" FontFamily="Segoe MDL2 Assets" Padding="0"                            
+                            Click="SwapPanePaths_Click" Tag="Left"
+                            ToolTipService.ToolTip="Swap panels"
+                            AutomationProperties.Name="Swap left and right panels"/>
+                        <Button Grid.Column="3" Content="&#xE700;" Padding="0"
+                            FontFamily="Segoe MDL2 Assets" FontWeight="Black"
+                            ToolTipService.ToolTip="Folder options" 
+                            AutomationProperties.Name="Folder options"
                             Tag="Left" Click="FolderPanelMenu_Click"/>
-                </Grid>
-                <Grid x:Name="LeftAddressArea" Grid.Row="1" ColumnSpacing="4">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="32"/>
-                    </Grid.ColumnDefinitions>
-                    <ScrollViewer x:Name="LeftBreadcrumbScroller" VerticalScrollBarVisibility="Disabled"
+
+                    </Grid>
+                    <Grid x:Name="LeftAddressArea" Grid.Row="1" ColumnSpacing="4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="32"/>
+
+                        </Grid.ColumnDefinitions>
+                        <ScrollViewer x:Name="LeftBreadcrumbScroller" VerticalScrollBarVisibility="Disabled"
                                   HorizontalScrollBarVisibility="Auto" VerticalAlignment="Center">
-                        <StackPanel x:Name="LeftBreadcrumbSegments" Orientation="Horizontal" Spacing="2"/>
-                    </ScrollViewer>
-                    <AutoSuggestBox x:Name="LeftAddress" Grid.Column="0" Height="32" PlaceholderText="Enter path"
+                            <StackPanel x:Name="LeftBreadcrumbSegments" Orientation="Horizontal" Spacing="2"/>
+                        </ScrollViewer>
+                        <AutoSuggestBox x:Name="LeftAddress" Grid.Column="0" Height="32" PlaceholderText="Enter path"
                                     QuerySubmitted="Address_QuerySubmitted" TextChanged="Address_TextChanged"
                                     Visibility="Collapsed" AutomationProperties.Name="Left pane path"/>
-                    <Button x:Name="LeftAddressButton" Grid.Column="1" Content="&#xE70F;" FontFamily="Segoe MDL2 Assets"
+                        <Button x:Name="LeftAddressButton" Grid.Column="1" Content="&#xE70F;" 
+                            FontFamily="Segoe MDL2 Assets" Padding="0"
                             Click="AddressEdit_Click" Tag="Left" ToolTipService.ToolTip="Edit path"
                             AutomationProperties.Name="Edit left pane path"/>
-                </Grid>
-                <ListView x:Name="LeftList" Grid.Row="2" SelectionMode="Multiple" IsItemClickEnabled="True"
+                    </Grid>
+                    <ListView x:Name="LeftList" Grid.Row="2" SelectionMode="Extended" IsMultiSelectCheckBoxEnabled="False" IsItemClickEnabled="True"
+                          ItemContainerStyle="{StaticResource CompactEntryContainerStyle}"
                           ItemClick="LeftList_ItemClick" DoubleTapped="LeftList_DoubleTapped"
                           SelectionChanged="ExplorerList_SelectionChanged"
                           PointerPressed="ExplorerList_PointerPressed" PointerWheelChanged="ExplorerList_PointerWheelChanged"
                           ContainerContentChanging="LeftList_ContainerContentChanging"
                           RightTapped="ExplorerList_RightTapped" KeyDown="ExplorerList_KeyDown"
-                          ItemsSource="{x:Bind LeftEntries}"/>
-              </Grid>
+                          CanDragItems="False" AllowDrop="True"
+                          DragOver="ExplorerList_DragOver" Drop="ExplorerList_Drop"
+                          ItemsSource="{x:Bind LeftEntries}"
+                          Padding="0,0,0,20">
+                        <!-- Padding at the bottom to allow for double tap on long lists -->
+                    </ListView>
+                </Grid>
             </Border>
             <Button x:Name="LeftRestoreButton" Grid.Column="0" Content="+" Visibility="Collapsed"
                     AutomationProperties.Name="Show left pane" ToolTipService.ToolTip="Restore dual-pane view"
@@ -323,54 +348,78 @@
                     PointerPressed="Splitter_PointerPressed" PointerMoved="Splitter_PointerMoved"
                     PointerReleased="Splitter_PointerReleased" PointerCanceled="Splitter_PointerCanceled"
                     PointerCaptureLost="Splitter_PointerCaptureLost" Tag="Panes"/>
+            <!-- Right explorer pane. -->
             <Border x:Name="RightPaneBorder" Grid.Column="2" Margin="5" BorderThickness="2"
                     BorderBrush="#4C5664" CornerRadius="5" PointerPressed="PaneBorder_PointerPressed">
-              <Grid x:Name="RightPanel" Margin="3">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="38"/>
-                    <RowDefinition Height="36"/>
-                    <RowDefinition Height="*"/>
-                </Grid.RowDefinitions>
-                <Grid Grid.Row="0" Background="Transparent" DoubleTapped="TabStrip_DoubleTapped" Tag="Right">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
-                    <StackPanel x:Name="RightTabs" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center"/>
-                    <Button Grid.Column="1" Content="&#xE700;" FontFamily="Segoe MDL2 Assets"
-                            ToolTipService.ToolTip="Folder options" AutomationProperties.Name="Folder options"
+                <Grid x:Name="RightPanel" Margin="3">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="38"/>
+                        <RowDefinition Height="36"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Grid Grid.Row="0" Background="Transparent" DoubleTapped="TabStrip_DoubleTapped" Tag="Right">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="32"/>
+                            <ColumnDefinition Width="32"/>
+                            <ColumnDefinition Width="32"/>
+                        </Grid.ColumnDefinitions>
+                        <StackPanel x:Name="RightTabs" Orientation="Horizontal" Spacing="4" VerticalAlignment="Center"/>
+                        <Button Grid.Column="3" Content="&#xE700;" 
+                            FontFamily="Segoe MDL2 Assets" Padding="0"
+                            ToolTipService.ToolTip="Folder options" 
+                            AutomationProperties.Name="Folder options"
                             Tag="Right" Click="FolderPanelMenu_Click"/>
-                </Grid>
-                <Grid x:Name="RightAddressArea" Grid.Row="1" ColumnSpacing="4">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="32"/>
-                    </Grid.ColumnDefinitions>
-                    <ScrollViewer x:Name="RightBreadcrumbScroller" VerticalScrollBarVisibility="Disabled"
+                        <Button Grid.Column="1" Content="&#xE96F;" 
+                            FontFamily="Segoe MDL2 Assets" Padding="0"
+                            Click="CopyPanePathToOther_Click" Tag="Right"
+                            ToolTipService.ToolTip="Show in left panel"
+                            AutomationProperties.Name="Show in left panel"/>
+                        <Button Grid.Column="2" Content="&#xF1CC;" 
+                            FontFamily="Segoe MDL2 Assets" Padding="0"
+                            Click="SwapPanePaths_Click" Tag="Right"
+                            ToolTipService.ToolTip="Swap panels"
+                            AutomationProperties.Name="Swap left and right panels"/>
+                    </Grid>
+                    <Grid x:Name="RightAddressArea" Grid.Row="1" ColumnSpacing="4">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/>
+                            <ColumnDefinition Width="32"/>
+                        </Grid.ColumnDefinitions>
+                        <ScrollViewer x:Name="RightBreadcrumbScroller" VerticalScrollBarVisibility="Disabled"
                                   HorizontalScrollBarVisibility="Auto" VerticalAlignment="Center">
-                        <StackPanel x:Name="RightBreadcrumbSegments" Orientation="Horizontal" Spacing="2"/>
-                    </ScrollViewer>
-                    <AutoSuggestBox x:Name="RightAddress" Grid.Column="0" Height="32" PlaceholderText="Enter path"
+                            <StackPanel x:Name="RightBreadcrumbSegments" Orientation="Horizontal" Spacing="2"/>
+                        </ScrollViewer>
+                        <AutoSuggestBox x:Name="RightAddress" Grid.Column="0" Height="32" PlaceholderText="Enter path"
                                     QuerySubmitted="Address_QuerySubmitted" TextChanged="Address_TextChanged"
                                     Visibility="Collapsed" AutomationProperties.Name="Right pane path"/>
-                    <Button x:Name="RightAddressButton" Grid.Column="1" Content="&#xE70F;" FontFamily="Segoe MDL2 Assets"
+                        <Button x:Name="RightAddressButton" Grid.Column="1" Content="&#xE70F;" 
+                            FontFamily="Segoe MDL2 Assets" Padding="0"
                             Click="AddressEdit_Click" Tag="Right" ToolTipService.ToolTip="Edit path"
                             AutomationProperties.Name="Edit right pane path"/>
-                </Grid>
-                <ListView x:Name="RightList" Grid.Row="2" SelectionMode="Multiple" IsItemClickEnabled="True"
+
+                    </Grid>
+                    <ListView x:Name="RightList" Grid.Row="2" SelectionMode="Extended" IsMultiSelectCheckBoxEnabled="False" IsItemClickEnabled="True"
+                          ItemContainerStyle="{StaticResource CompactEntryContainerStyle}"
                           ItemClick="RightList_ItemClick" DoubleTapped="RightList_DoubleTapped"
                           SelectionChanged="ExplorerList_SelectionChanged"
                           PointerPressed="ExplorerList_PointerPressed" PointerWheelChanged="ExplorerList_PointerWheelChanged"
                           ContainerContentChanging="RightList_ContainerContentChanging"
                           RightTapped="ExplorerList_RightTapped" KeyDown="ExplorerList_KeyDown"
-                          ItemsSource="{x:Bind RightEntries}"/>
-              </Grid>
+                          CanDragItems="False" AllowDrop="True"
+                          DragOver="ExplorerList_DragOver" Drop="ExplorerList_Drop"
+                          ItemsSource="{x:Bind RightEntries}"
+                          Padding="0,0,0,20">
+                        <!-- Padding at the bottom to allow for double tap on long lists -->
+                    </ListView>
+                </Grid>
             </Border>
             <Button x:Name="RightRestoreButton" Grid.Column="2" Content="+" Visibility="Collapsed"
                     AutomationProperties.Name="Show right pane" ToolTipService.ToolTip="Restore dual-pane view"
                     Click="RestorePaneButton_Click" Tag="Right"/>
         </Grid>
 
+        <!-- Status message and thumbnail-view size control. -->
         <Border Grid.Row="4" Grid.ColumnSpan="3" Background="Transparent"
                 BorderBrush="#303640" BorderThickness="0,1,0,0">
             <Grid Padding="12,0">

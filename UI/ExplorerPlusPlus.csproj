@@ -17,9 +17,13 @@
     <None Update="Assets\FileExplorerIcon.ico" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="FluentFTP" Version="55.1.0" />
     <PackageReference Include="HelixToolkit.SharpDX.Assimp" Version="3.1.2" />
     <PackageReference Include="HelixToolkit.WinUI.SharpDX" Version="3.1.2" />
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.7.250606001" />
+    <PackageReference Include="BCnEncoder.Net.ImageSharp" Version="1.1.3" />
+    <PackageReference Include="CodeWalker.Core" Version="1.0.3" />
+    <PackageReference Include="SSH.NET" Version="2026.0.1" />
     <PackageReference Include="System.Drawing.Common" Version="8.0.0" />
     <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="SixLabors.ImageSharp" Version="4.1.3" />

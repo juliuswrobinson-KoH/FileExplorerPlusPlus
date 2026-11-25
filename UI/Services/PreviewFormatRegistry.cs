@@ -11,8 +11,9 @@ public static class PreviewFormatRegistry
     private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)
     {
         ".apng", ".avif", ".bmp", ".blp", ".dib", ".dds", ".exr", ".gif", ".hdr", ".heic", ".heif",
-        ".ico", ".jfif", ".jpe", ".jpeg", ".jpg", ".jxl", ".pbm", ".pfm", ".pgm", ".pic", ".png", ".pnm",
-        ".ppm", ".psd", ".qoi", ".tga", ".tif", ".tiff", ".webp"
+        ".blp2", ".ico", ".jfif", ".jpe", ".jpeg", ".jpg", ".jxl", ".ktx", ".ktx2", ".pbm", ".pfm", ".pgm",
+        ".pic", ".png", ".pnm", ".ppm", ".psd", ".qoi", ".tga", ".tif", ".tiff", ".txd", ".vtf", ".webp",
+        ".ytd"
     };
 
     private static readonly HashSet<string> ModelExtensions = new(StringComparer.OrdinalIgnoreCase)
@@ -28,6 +29,7 @@ public static class PreviewFormatRegistry
 
     public static bool IsImage(string path) => ImageExtensions.Contains(Path.GetExtension(path)) || ImageProviders.ContainsKey(Path.GetExtension(path));
     public static bool IsModel(string path) => ModelExtensions.Contains(Path.GetExtension(path)) || ModelImporters.ContainsKey(Path.GetExtension(path));
+    public static bool IsTexture(string path) => TextureImageDecoder.Supports(Path.GetExtension(path));
 
     public static void RegisterImageProvider(string extension, Func<Stream, int, byte[]?> provider)
     {
@@ -45,6 +47,24 @@ public static class PreviewFormatRegistry
         return DecodeImage(stream, Path.GetExtension(path), size);
     }
 
+    public static byte[]? DecodeImageOriginal(string path)
+    {
+        using var stream = File.OpenRead(path);
+        return DecodeImage(stream, Path.GetExtension(path), 0);
+    }
+
+    internal static IReadOnlyList<DecodedTextureImage> DecodeImagesOriginal(string path)
+    {
+        using var stream = File.OpenRead(path);
+        var extension = Path.GetExtension(path);
+        if (TextureImageDecoder.Supports(extension))
+            return TextureImageDecoder.DecodeAll(stream, extension, 0);
+
+        var pngBytes = DecodeImage(stream, extension, 0) ??
+            throw new NotSupportedException($"No decoder is available for {extension}.");
+        return [new DecodedTextureImage(null, pngBytes)];
+    }
+
     public static byte[]? DecodeImage(Stream stream, string extension, int size)
     {
         if (ImageProviders.TryGetValue(extension, out var provider))
@@ -54,16 +74,21 @@ public static class PreviewFormatRegistry
 
         if (stream.CanSeek)
             stream.Position = 0;
+        if (TextureImageDecoder.Supports(extension))
+            return TextureImageDecoder.Decode(stream, extension, size);
+
         using var image = Image.Load<Rgba32>(stream);
-        var maxSide = 4096;
+        const int maxSide = 4096;
         if (image.Width > maxSide || image.Height > maxSide || (long)image.Width * image.Height > 40_000_000)
             throw new InvalidDataException("Image exceeds the preview size limit.");
-
-        image.Mutate(context => context.Resize(new ResizeOptions
+        if (size > 0)
         {
-            Size = new Size(size, size),
-            Mode = ResizeMode.Max
-        }));
+            image.Mutate(context => context.Resize(new ResizeOptions
+            {
+                Size = new Size(size, size),
+                Mode = ResizeMode.Max
+            }));
+        }
         using var output = new MemoryStream();
         image.SaveAsPng(output);
         return output.ToArray();

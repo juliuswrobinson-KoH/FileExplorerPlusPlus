@@ -11,6 +11,7 @@ public static class ShellIconService
 {
     private const uint ShgfiIcon = 0x000000100;
     private const uint ShgfiSmallIcon = 0x000000001;
+    private const uint ShgfiPidl = 0x000000008;
     private const uint ShgfiUseFileAttributes = 0x000000010;
     private static readonly SemaphoreSlim IconLimit = new(4);
     private static readonly Dictionary<string, byte[]> IconCache = new(StringComparer.OrdinalIgnoreCase);
@@ -40,6 +41,139 @@ public static class ShellIconService
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or ExternalException)
         {
             return null;
+        }
+    }
+
+    public static async Task<ImageSource?> LoadIconResourceAsync(string modulePath, int iconIndex)
+    {
+        try
+        {
+            await IconLimit.WaitAsync();
+            try
+            {
+                var bytes = await Task.Run(() => GetIconResourceBytes(modulePath, iconIndex));
+                if (bytes is null)
+                    return null;
+
+                var image = new BitmapImage();
+                using var stream = new MemoryStream(bytes);
+                await image.SetSourceAsync(stream.AsRandomAccessStream());
+                return image;
+            }
+            finally
+            {
+                IconLimit.Release();
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or ExternalException)
+        {
+            return null;
+        }
+    }
+
+    public static async Task<ImageSource?> LoadShellItemIconAsync(string parsingName)
+    {
+        try
+        {
+            await IconLimit.WaitAsync();
+            try
+            {
+                var bytes = await Task.Run(() => GetShellItemIconBytes(parsingName));
+                if (bytes is null)
+                    return null;
+
+                var image = new BitmapImage();
+                using var stream = new MemoryStream(bytes);
+                await image.SetSourceAsync(stream.AsRandomAccessStream());
+                return image;
+            }
+            finally
+            {
+                IconLimit.Release();
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or ExternalException)
+        {
+            return null;
+        }
+    }
+
+    private static byte[]? GetShellItemIconBytes(string parsingName)
+    {
+        var cacheKey = $"{parsingName}|shell-item";
+        lock (CacheLock)
+        {
+            if (IconCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+        }
+
+        var result = SHParseDisplayName(parsingName, IntPtr.Zero, out var itemIdList, 0, IntPtr.Zero);
+        Marshal.ThrowExceptionForHR(result);
+        try
+        {
+            var info = new ShellFileInfo();
+            if (SHGetFileInfo(itemIdList, 0, ref info, (uint)Marshal.SizeOf<ShellFileInfo>(),
+                    ShgfiIcon | ShgfiSmallIcon | ShgfiPidl) == IntPtr.Zero ||
+                info.Icon == IntPtr.Zero)
+                return null;
+
+            try
+            {
+                using var shellIcon = (Icon)Icon.FromHandle(info.Icon).Clone();
+                using var bitmap = shellIcon.ToBitmap();
+                using var stream = new MemoryStream();
+                bitmap.Save(stream, ImageFormat.Png);
+                var bytes = stream.ToArray();
+                lock (CacheLock)
+                    IconCache[cacheKey] = bytes;
+                return bytes;
+            }
+            finally
+            {
+                DestroyIcon(info.Icon);
+            }
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(itemIdList);
+        }
+    }
+
+    private static byte[]? GetIconResourceBytes(string modulePath, int iconIndex)
+    {
+        var cacheKey = $"{modulePath}|resource:{iconIndex}";
+        lock (CacheLock)
+        {
+            if (IconCache.TryGetValue(cacheKey, out var cached))
+                return cached;
+        }
+
+        var large = new IntPtr[1];
+        var small = new IntPtr[1];
+        if (ExtractIconEx(modulePath, iconIndex, large, small, 1) == 0)
+            return null;
+
+        var icon = small[0] != IntPtr.Zero ? small[0] : large[0];
+        var unusedIcon = small[0] != IntPtr.Zero ? large[0] : IntPtr.Zero;
+        if (icon == IntPtr.Zero)
+            return null;
+
+        try
+        {
+            using var shellIcon = (Icon)Icon.FromHandle(icon).Clone();
+            using var bitmap = shellIcon.ToBitmap();
+            using var stream = new MemoryStream();
+            bitmap.Save(stream, ImageFormat.Png);
+            var bytes = stream.ToArray();
+            lock (CacheLock)
+                IconCache[cacheKey] = bytes;
+            return bytes;
+        }
+        finally
+        {
+            DestroyIcon(icon);
+            if (unusedIcon != IntPtr.Zero)
+                DestroyIcon(unusedIcon);
         }
     }
 
@@ -171,6 +305,12 @@ public static class ShellIconService
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr SHGetFileInfo(string path, uint fileAttributes, ref ShellFileInfo fileInfo, uint fileInfoSize, uint flags);
+
+    [DllImport("shell32.dll", EntryPoint = "SHGetFileInfoW", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SHGetFileInfo(IntPtr itemIdList, uint fileAttributes, ref ShellFileInfo fileInfo, uint fileInfoSize, uint flags);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHParseDisplayName(string name, IntPtr bindContext, out IntPtr itemIdList, uint attributesIn, IntPtr attributesOut);
 
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern uint ExtractIconEx(string fileName, int iconIndex, IntPtr[] largeIcons, IntPtr[] smallIcons, uint iconCount);

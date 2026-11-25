@@ -7,6 +7,10 @@ namespace UI.Services;
 public static class FileSystemService
 {
     public static bool IsArchivePath(string path) => path.Contains('|');
+    public static bool IsRemotePath(string path) => RemoteFileSystemService.IsRemotePath(path);
+    public static string NormalizeLocation(string path) => RemoteFileSystemService.NormalizeAddress(path);
+    public static string CombinePath(string path, string name) => RemoteFileSystemService.CombinePath(path, name);
+    public static string GetName(string path) => RemoteFileSystemService.GetName(path);
 
     public static string ArchivePath(string archiveFile, string entryPath = "") =>
         $"{archiveFile}|{entryPath.Replace('\\', '/').Trim('/')}";
@@ -19,7 +23,67 @@ public static class FileSystemService
 
     public static IEnumerable<ExplorerEntry> GetEntries(string path)
     {
+        if (IsRemotePath(path))
+            return RemoteFileSystemService.GetEntries(path);
+        if (NetworkShareService.IsServerPath(path))
+            return NetworkShareService.GetShares(path);
         return IsArchivePath(path) ? GetArchiveEntries(path) : GetFileSystemEntries(path);
+    }
+
+    public static void CreateDirectory(string path)
+    {
+        if (IsRemotePath(path))
+            RemoteFileSystemService.CreateDirectory(path);
+        else
+            Directory.CreateDirectory(path);
+    }
+
+    public static void WriteFile(string path, byte[] contents)
+    {
+        if (IsRemotePath(path))
+        {
+            using var stream = new MemoryStream(contents, writable: false);
+            RemoteFileSystemService.WriteFile(path, stream);
+        }
+        else
+        {
+            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            stream.Write(contents);
+        }
+    }
+
+    public static void Rename(string path, string newPath, bool isDirectory)
+    {
+        if (IsRemotePath(path))
+            RemoteFileSystemService.Rename(path, newPath);
+        else if (isDirectory)
+            Directory.Move(path, newPath);
+        else
+            File.Move(path, newPath);
+    }
+
+    public static void Delete(string path, bool isDirectory, bool permanent)
+    {
+        if (IsRemotePath(path))
+        {
+            RemoteFileSystemService.Delete(path, isDirectory);
+            return;
+        }
+
+        if (isDirectory)
+            Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(
+                path,
+                Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                permanent
+                    ? Microsoft.VisualBasic.FileIO.RecycleOption.DeletePermanently
+                    : Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
+        else
+            Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
+                path,
+                Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
+                permanent
+                    ? Microsoft.VisualBasic.FileIO.RecycleOption.DeletePermanently
+                    : Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
     }
 
     private static IEnumerable<ExplorerEntry> GetFileSystemEntries(string path)
@@ -122,6 +186,13 @@ public static class FileSystemService
 
     public static string GetParent(string path)
     {
+        if (RecycleBinService.IsPath(path))
+            return path;
+        if (IsRemotePath(path))
+            return RemoteFileSystemService.GetParent(path);
+        if (NetworkShareService.IsServerPath(path))
+            return path;
+
         if (IsArchivePath(path))
         {
             var (archive, entry) = SplitArchivePath(path);
@@ -175,10 +246,34 @@ public static class FileSystemService
 
     public static void CopyDirectory(string source, string destination)
     {
+        var sourcePath = NormalizeDirectoryPath(source);
+        var destinationPath = NormalizeDirectoryPath(destination);
+        var sourcePrefix = sourcePath.EndsWith(Path.DirectorySeparatorChar)
+            ? sourcePath
+            : sourcePath + Path.DirectorySeparatorChar;
+        if (string.Equals(sourcePath, destinationPath, StringComparison.OrdinalIgnoreCase) ||
+            destinationPath.StartsWith(sourcePrefix, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("A folder cannot be copied into itself or one of its subfolders.");
+
         Directory.CreateDirectory(destination);
         foreach (var file in Directory.EnumerateFiles(source))
-            File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), overwrite: false);
+        {
+            if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) == 0)
+                File.Copy(file, Path.Combine(destination, Path.GetFileName(file)), overwrite: false);
+        }
         foreach (var directory in Directory.EnumerateDirectories(source))
-            CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
+        {
+            if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) == 0)
+                CopyDirectory(directory, Path.Combine(destination, Path.GetFileName(directory)));
+        }
+    }
+
+    private static string NormalizeDirectoryPath(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(fullPath);
+        return string.Equals(fullPath, root, StringComparison.OrdinalIgnoreCase)
+            ? fullPath
+            : fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
     }
 }

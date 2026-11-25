@@ -10,6 +10,8 @@ public static class ShellContextMenuService
     public const uint PasteCommand = 0x7003;
     public const uint DeleteCommand = 0x7004;
     public const uint AdminCommandPromptCommand = 0x7005;
+    public const uint RemoveFavoriteCommand = 0x7006;
+    public const uint ConvertImagesToPngCommand = 0x7007;
     private const uint FirstShellCommand = 1;
     private const uint LastShellCommand = 0x6FFF;
     private const uint MenuFlagString = 0x00000000;
@@ -20,15 +22,25 @@ public static class ShellContextMenuService
     private static readonly Guid ShellFolderId = new("000214E6-0000-0000-C000-000000000046");
     private static readonly Guid ContextMenuId = new("000214E4-0000-0000-C000-000000000046");
 
-    public static uint Show(IntPtr owner, IReadOnlyList<string> paths, bool showPaste)
+    public static uint Show(
+        IntPtr owner,
+        IReadOnlyList<string> paths,
+        bool showPaste,
+        bool showRemoveFavorite = false,
+        bool includeExplorerPlusPlusCommands = true)
     {
-        if (paths.Count == 0 || paths.Any(path => !File.Exists(path) && !Directory.Exists(path)))
+        if (paths.Count == 0 || paths.Any(path =>
+                !File.Exists(path) && !Directory.Exists(path) &&
+                !path.StartsWith("::", StringComparison.Ordinal)))
             return 0;
 
-        var parentPath = Path.GetDirectoryName(paths[0]);
-        if (string.IsNullOrEmpty(parentPath) ||
-            paths.Any(path => !string.Equals(Path.GetDirectoryName(path), parentPath, StringComparison.OrdinalIgnoreCase)))
-            return 0;
+        if (paths.Count > 1)
+        {
+            var parentPath = Path.GetDirectoryName(paths[0]);
+            if (string.IsNullOrEmpty(parentPath) ||
+                paths.Any(path => !string.Equals(Path.GetDirectoryName(path), parentPath, StringComparison.OrdinalIgnoreCase)))
+                return 0;
+        }
 
         var menu = CreatePopupMenu();
         if (menu == IntPtr.Zero)
@@ -64,15 +76,25 @@ public static class ShellContextMenuService
             Marshal.ThrowExceptionForHR(contextMenu.QueryContextMenu(
                 menu, 0, FirstShellCommand, LastShellCommand, QueryContextMenuNormal));
 
-            AppendMenuW(menu, MenuFlagSeparator, UIntPtr.Zero, null);
-            AppendMenuW(menu, MenuFlagString, new UIntPtr(PreviewCommand), "Preview");
-            AppendMenuW(menu, MenuFlagString, new UIntPtr(HexCommand), "Hex / entry");
-            AppendMenuW(menu, MenuFlagString, new UIntPtr(AppPropertiesCommand), "Explorer++ properties");
-            if (showPaste)
-                AppendMenuW(menu, MenuFlagString, new UIntPtr(PasteCommand), "Paste");
-            AppendMenuW(menu, MenuFlagString, new UIntPtr(DeleteCommand), "Delete (Recycle Bin)");
-            AppendMenuW(menu, MenuFlagString, new UIntPtr(AdminCommandPromptCommand),
-                "Open command prompt as administrator");
+            if (includeExplorerPlusPlusCommands || showRemoveFavorite)
+                AppendMenuW(menu, MenuFlagSeparator, UIntPtr.Zero, null);
+            if (includeExplorerPlusPlusCommands)
+            {
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(PreviewCommand), "Preview");
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(HexCommand), "Hex / entry");
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(AppPropertiesCommand), "Explorer++ properties");
+                if (showPaste)
+                    AppendMenuW(menu, MenuFlagString, new UIntPtr(PasteCommand), "Paste");
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(DeleteCommand), "Delete Permanently");
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(AdminCommandPromptCommand),
+                    "Open command prompt as administrator");
+                if (paths.All(path => File.Exists(path) && PreviewFormatRegistry.IsImage(path)) &&
+                    paths.Any(path => !Path.GetExtension(path).Equals(".png", StringComparison.OrdinalIgnoreCase)))
+                    AppendMenuW(menu, MenuFlagString, new UIntPtr(ConvertImagesToPngCommand),
+                        "Convert selected images to PNG");
+            }
+            if (showRemoveFavorite)
+                AppendMenuW(menu, MenuFlagString, new UIntPtr(RemoveFavoriteCommand), "Remove favorite");
 
             if (!GetCursorPos(out var cursor))
                 throw new COMException("Windows could not determine the context-menu position.", Marshal.GetLastWin32Error());

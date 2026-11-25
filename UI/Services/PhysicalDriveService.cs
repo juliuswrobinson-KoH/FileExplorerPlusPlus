@@ -1,5 +1,8 @@
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Management;
 using System.Text.RegularExpressions;
+using Microsoft.Win32;
 using UI.Models;
 
 namespace UI.Services;
@@ -25,6 +28,7 @@ public static partial class PhysicalDriveService
                 var index = Convert.ToInt32(item["Index"]);
                 var model = Convert.ToString(item["Model"])?.Trim() ?? "Physical disk";
                 var size = item["Size"] is null ? 0L : Convert.ToInt64(item["Size"]);
+                var formattedSize = size > 0 ? FileSystemService.FormatSize(size) : "";
                 var interfaceType = Convert.ToString(item["InterfaceType"]) ?? "";
                 var mediaType = Convert.ToString(item["MediaType"]) ?? "";
                 var pnpDeviceId = Convert.ToString(item["PNPDeviceID"]) ?? "";
@@ -34,10 +38,10 @@ public static partial class PhysicalDriveService
                 drives[index] = new PhysicalDrive
                 {
                     DiskIndex = index,
-                    Name = $"Physical drive {index}",
-                    Model = model,
+                    Name = $"{index}.{mediaType}",
+                    Model = $"[{index}] {model} ({formattedSize}) - {mediaType}",
                     SizeBytes = size,
-                    SizeText = size > 0 ? FileSystemService.FormatSize(size) : "",
+                    SizeText = formattedSize,
                     IsRemovable = isRemovable
                 };
                 if (isRemovable)
@@ -85,7 +89,7 @@ public static partial class PhysicalDriveService
         {
             if (!drives.TryGetValue(key.Disk, out var drive))
                 continue;
-            var partitionName = $"Partition {key.Partition + 1}";
+            var partitionName = $"Part. {key.Partition + 1}";
             var size = partitionSizes[key];
             if (volumePaths.Count == 0)
             {
@@ -123,6 +127,105 @@ public static partial class PhysicalDriveService
             }
         }
 
+        var networkDriveInfo = DriveInfo.GetDrives()
+            .Where(drive => drive.DriveType == DriveType.Network)
+            .ToDictionary(drive => drive.Name, StringComparer.OrdinalIgnoreCase);
+        var networkDriveTargets = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var drive in networkDriveInfo.Keys)
+        {
+            var target = GetNetworkDriveTarget(drive.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            if (!string.IsNullOrWhiteSpace(target))
+                networkDriveTargets[drive] = target;
+        }
+        using (var mappedDrivesKey = Registry.CurrentUser.OpenSubKey("Network", writable: false))
+        {
+            foreach (var driveLetter in mappedDrivesKey?.GetSubKeyNames() ?? [])
+            {
+                if (driveLetter.Length != 1 || !char.IsLetter(driveLetter[0]))
+                    continue;
+                using var mappedDriveKey = mappedDrivesKey!.OpenSubKey(driveLetter, writable: false);
+                var target = mappedDriveKey?.GetValue("RemotePath") as string;
+                var drivePath = driveLetter + @":\";
+                if (!string.IsNullOrWhiteSpace(target))
+                    networkDriveTargets.TryAdd(drivePath, target);
+                else
+                    networkDriveTargets.TryAdd(drivePath, "");
+            }
+        }
+
+        var networkDrivePaths = networkDriveInfo.Keys
+            .Concat(networkDriveTargets.Keys)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (networkDrivePaths.Length > 0)
+        {
+            var networkGroup = new PhysicalDrive
+            {
+                DiskIndex = -1,
+                Name = "Network drives",
+                Model = "Network drives",
+                IsNetwork = true
+            };
+            foreach (var drivePath in networkDrivePaths)
+            {
+                networkDriveInfo.TryGetValue(drivePath, out var networkDrive);
+                networkDriveTargets.TryGetValue(drivePath, out var target);
+                var name = drivePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                var details = string.IsNullOrWhiteSpace(target) ? "Network drive" : target;
+                var navigationPath = string.IsNullOrWhiteSpace(target) ? drivePath : target;
+                try
+                {
+                    if (networkDrive is not null && networkDrive.IsReady)
+                    {
+                        if (!string.IsNullOrWhiteSpace(networkDrive.VolumeLabel))
+                            name += $" — {networkDrive.VolumeLabel}";
+                        details = $"{(string.IsNullOrWhiteSpace(target) ? "Network drive" : target)} • {networkDrive.DriveFormat} • {FileSystemService.FormatSize(networkDrive.TotalSize)}";
+                    }
+                    else
+                    {
+                        details = string.IsNullOrWhiteSpace(target)
+                            ? networkDrive is null ? "??" : "!?"
+                            : $"{target}{(networkDrive is null ? "" : " • !?")}";
+                    }
+                }
+                catch (IOException)
+                {
+                    details = string.IsNullOrWhiteSpace(target) ? "!?" : $"{target} • !?";
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    details = string.IsNullOrWhiteSpace(target) ? "!?" : $"{target} • !?";
+                }
+
+                networkGroup.Partitions.Add(new DrivePartition
+                {
+                    Name = name,
+                    Details = details,
+                    Path = navigationPath,
+                    DiskIndex = -1,
+                    IsNetwork = true
+                });
+            }
+            drives.Add(networkGroup.DiskIndex, networkGroup);
+        }
+
         return drives.Values.OrderBy(drive => drive.Name, StringComparer.OrdinalIgnoreCase).ToArray();
     }
+
+    private static string? GetNetworkDriveTarget(string driveName)
+    {
+        var bufferLength = 512;
+        var buffer = new StringBuilder(bufferLength);
+        var status = WNetGetConnection(driveName, buffer, ref bufferLength);
+        if (status == 234 && bufferLength > 0)
+        {
+            buffer = new StringBuilder(bufferLength);
+            status = WNetGetConnection(driveName, buffer, ref bufferLength);
+        }
+        return status == 0 ? buffer.ToString() : null;
+    }
+
+    [DllImport("mpr.dll", CharSet = CharSet.Unicode)]
+    private static extern int WNetGetConnection(string localName, StringBuilder remoteName, ref int length);
 }

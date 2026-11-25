@@ -1,3 +1,9 @@
 <Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="TelecomStorageSupport/TelecomStorageSupport.vcxproj" Id="60966150-42f6-43e1-8985-fcd5e61bd5f4" />
   <Project Path="UI/ExplorerPlusPlus.csproj" Id="7ce16b5d-102a-40e2-a2bf-d87a3e6148a3" />
 </Solution>

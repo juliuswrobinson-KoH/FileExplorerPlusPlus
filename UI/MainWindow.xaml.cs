@@ -2,9 +2,12 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO.Compression;
 using System.IO.Enumeration;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using Windows.ApplicationModel.DataTransfer;
+using Microsoft.UI.Input.DragDrop;
 using Microsoft.UI.Composition;
 using Microsoft.UI.Composition.SystemBackdrops;
 using Microsoft.UI.Dispatching;
@@ -28,6 +31,7 @@ namespace UI;
 
 public sealed partial class MainWindow : Window
 {
+    private const string InternalDragFormat = "ExplorerPlusPlus.Paths";
     private readonly ObservableCollection<ExplorerEntry> _leftEntries = [];
     private readonly ObservableCollection<ExplorerEntry> _rightEntries = [];
     private readonly ObservableCollection<PhysicalDrive> _physicalDrives = [];
@@ -49,6 +53,9 @@ public sealed partial class MainWindow : Window
     private readonly List<FilePropertiesWindow> _propertyWindows = [];
     private readonly DispatcherQueueTimer _driveRefreshTimer;
     private readonly DispatcherQueueTimer _sessionSaveTimer;
+    private readonly SemaphoreSlim _clipboardHistoryCaptureGate = new(1, 1);
+    private WindowsClipboardMonitor? _windowsClipboardMonitor;
+    private ClipboardHistoryService? _clipboardHistory;
     private Window? _settingsWindow;
     private DispatcherQueue _uiDispatcherQueue = null!;
     private ExplorerSettings _settings = new();
@@ -74,6 +81,7 @@ public sealed partial class MainWindow : Window
     private bool _updatingSearchBox;
     private bool _restoringPaneSelection;
     private int _treeRefreshVersion;
+    private TreeViewNode? _computerRoot;
     private int _leftLoadGeneration;
     private int _rightLoadGeneration;
     private Border? _activeSplitter;
@@ -87,6 +95,8 @@ public sealed partial class MainWindow : Window
     private bool _leftPaneOpen = true;
     private bool _rightPaneOpen = true;
     private bool _singlePaneMode;
+    private bool _leftSelectionCheckBoxesEnabled;
+    private bool _rightSelectionCheckBoxesEnabled;
     private bool _refreshShellChangesOnActivation;
     private bool _initialLoadStarted;
     private bool _sessionPersistenceEnabled;
@@ -94,6 +104,14 @@ public sealed partial class MainWindow : Window
     private long _lastPointerClickTimestamp;
     private bool _lastPointerClickLeft;
     private bool _suppressTabClick;
+    private ListView? _internalDragList;
+    private string? _internalDragPath;
+    private string? _internalDragDestination;
+    private Button? _internalDragTargetButton;
+    private Brush? _internalDragTargetBackground;
+    private string[] _internalDragSources = [];
+    private Windows.Foundation.Point _internalDragStart;
+    private bool _internalDragStarted;
     private bool _tabDragStarted;
     private bool _tabDragLeft;
     private int _tabDragIndex = -1;
@@ -120,6 +138,10 @@ public sealed partial class MainWindow : Window
     {
         _initializing = true;
         InitializeComponent();
+        Root.AddHandler(UIElement.PointerMovedEvent,
+            new PointerEventHandler(InternalDrag_PointerMoved), handledEventsToo: true);
+        Root.AddHandler(UIElement.PointerReleasedEvent,
+            new PointerEventHandler(InternalDrag_PointerReleased), handledEventsToo: true);
         _uiDispatcherQueue = DispatcherQueue.GetForCurrentThread();
         _settings = ExplorerSettingsService.Load(out _settingsLoadError);
         _settings.Session ??= new ExplorerSessionState();
@@ -160,8 +182,8 @@ public sealed partial class MainWindow : Window
         Root.AddHandler(UIElement.KeyDownEvent, new KeyEventHandler(MainWindow_KeyDown), true);
         ExtendsContentIntoTitleBar = true;
         SetTitleBar(TitleBarDragRegion);
-        var appWindow = AppWindow.GetFromWindowId(
-            Microsoft.UI.Win32Interop.GetWindowIdFromWindow(WindowNative.GetWindowHandle(this)));
+        var windowHandle = WindowNative.GetWindowHandle(this);
+        var appWindow = AppWindow.GetFromWindowId(Microsoft.UI.Win32Interop.GetWindowIdFromWindow(windowHandle));
         appWindow.SetIcon(Path.Combine(AppContext.BaseDirectory, "Assets", "FileExplorerIcon.ico"));
         appWindow.TitleBar.BackgroundColor = Microsoft.UI.Colors.Transparent;
         appWindow.TitleBar.InactiveBackgroundColor = Microsoft.UI.Colors.Transparent;
@@ -208,8 +230,23 @@ public sealed partial class MainWindow : Window
         _leftForward.AddRange(_settings.Session.LeftForwardHistory.Where(IsRestorablePath));
         _rightBack.AddRange(_settings.Session.RightBackHistory.Where(IsRestorablePath));
         _rightForward.AddRange(_settings.Session.RightForwardHistory.Where(IsRestorablePath));
+        if (string.IsNullOrWhiteSpace(_settings.ClipboardHistoryDirectory))
+        {
+            var historyRoot = FileSystemService.IsArchivePath(CurrentPath) || FileSystemService.IsRemotePath(CurrentPath)
+                ? documentsFolder
+                : CurrentPath;
+            _settings.ClipboardHistoryDirectory = Path.Combine(historyRoot, ".ExplorerPlusPlusClipboardHistory");
+            try
+            {
+                ExplorerSettingsService.Save(_settings);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                _settingsLoadError = $"The clipboard history location could not be saved: {exception.Message}";
+            }
+        }
         SetActivePane(true);
-        QuickAccessList.ItemsSource = BuildQuickAccess();
+        InitializeNavigationTree();
         SetPaneView(true, GetViewIndex(true));
         SetPaneView(false, GetViewIndex(false));
         UpdateViewControls();
@@ -222,9 +259,25 @@ public sealed partial class MainWindow : Window
         _sessionSaveTimer = DispatcherQueue.GetForCurrentThread().CreateTimer();
         _sessionSaveTimer.Interval = TimeSpan.FromSeconds(2);
         _sessionSaveTimer.Tick += (_, _) => SaveSessionCheckpoint();
+        try
+        {
+            _windowsClipboardMonitor = new WindowsClipboardMonitor(
+                windowHandle,
+                WindowsClipboardChanged,
+                exception =>
+                {
+                    StatusText.Text = $"Could not capture Windows clipboard data: {exception.Message}";
+                    Debug.WriteLine(StatusText.Text);
+                });
+        }
+        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or DllNotFoundException or EntryPointNotFoundException)
+        {
+            _settingsLoadError = $"Windows clipboard monitoring could not start: {exception.Message}";
+        }
         Activated += MainWindow_Activated;
         Closed += (_, _) =>
         {
+            _windowsClipboardMonitor?.Dispose();
             _settingsWindow?.Close();
             _driveRefreshTimer.Stop();
             _sessionSaveTimer.Stop();
@@ -263,7 +316,6 @@ public sealed partial class MainWindow : Window
             Root.Background = new SolidColorBrush(ParseFontColor(_settings.BackgroundFallbackColor));
             return;
         }
-
         _backdropConfiguration = new SystemBackdropConfiguration
         {
             IsInputActive = true,
@@ -330,25 +382,139 @@ public sealed partial class MainWindow : Window
     private List<QuickLocation> BuildQuickAccess()
     {
         var locations = new List<QuickLocation>();
-        AddLocation("Home", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "\uE80F", locations);
-        AddLocation("Desktop", Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "\uE8FC", locations);
-        AddLocation("Documents", Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "\uE8A5", locations);
-        AddLocation("Downloads", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads"), "\uE896", locations);
-        AddLocation("Pictures", Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "\uEB9F", locations);
-        AddLocation("This PC", Environment.GetFolderPath(Environment.SpecialFolder.MyComputer), "\uE7F4", locations);
+        var knownPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        AddLocation("Home", Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "\uE80F",
+            locations, knownPaths, iconResourceIndex: 317);
+        AddLocation("Desktop", Environment.GetFolderPath(Environment.SpecialFolder.Desktop), "\uE8FC", locations, knownPaths);
+        AddLocation("Documents", Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "\uE8A5", locations, knownPaths);
+        AddLocation("Downloads", KnownFolderService.GetDownloadsPath(), "\uE896", locations, knownPaths);
+        AddLocation("Pictures", Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "\uEB9F", locations, knownPaths);
+        AddLocation("Music", Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "\uE189", locations, knownPaths);
+        AddLocation("Videos", Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "\uE714", locations, knownPaths);
         foreach (var bookmark in _settings.Bookmarks.Where(IsRestorablePath))
         {
-            var label = Path.GetFileName(bookmark.TrimEnd('\\', '/'));
-            locations.Add(new QuickLocation(string.IsNullOrEmpty(label) ? bookmark : label, bookmark, "\uE734"));
+            var label = FileSystemService.IsRemotePath(bookmark)
+                ? FileSystemService.GetName(bookmark)
+                : Path.GetFileName(bookmark.TrimEnd('\\', '/'));
+            AddLocation(string.IsNullOrEmpty(label) ? bookmark : label, bookmark, "\uE734", locations, knownPaths, canRemove: true);
         }
-        foreach (var recent in _settings.RecentLocations.Where(IsRestorablePath).Take(8))
+        var recentCount = 0;
+        foreach (var recent in _settings.RecentLocations.Where(IsRestorablePath))
         {
-            var label = Path.GetFileName(recent.TrimEnd('\\', '/'));
-            locations.Add(new QuickLocation(string.IsNullOrEmpty(label) ? recent : label, recent, "\uE823"));
+            var label = FileSystemService.IsRemotePath(recent)
+                ? FileSystemService.GetName(recent)
+                : Path.GetFileName(recent.TrimEnd('\\', '/'));
+            if (AddLocation(string.IsNullOrEmpty(label) ? recent : label, recent, "\uE823", locations, knownPaths) &&
+                ++recentCount == 8)
+                break;
         }
         foreach (var set in _settings.FolderSets.Where(set => IsRestorablePath(set.LeftPath) && IsRestorablePath(set.RightPath)))
-            locations.Add(new QuickLocation(set.Name, set.LeftPath, "\uE8B9", set.RightPath));
+            AddLocation(set.Name, set.LeftPath, "\uE8B9", locations, knownPaths, set.RightPath, canRemove: true);
         return locations;
+    }
+
+    private void InitializeNavigationTree()
+    {
+        FolderTree.RootNodes.Clear();
+        _computerRoot = new TreeViewNode
+        {
+            Content = new TreeItem("This PC", "", false, false, "\uE7F4",
+                isComputerRoot: true, shellPath: "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")
+            {
+                FileIconSize = _settings.FileIconSize
+            },
+            IsExpanded = true
+        };
+        RefreshQuickAccessTree();
+        FolderTree.RootNodes.Add(_computerRoot);
+        RefreshComputerTree();
+
+        var recycleBinItem = new TreeItem(
+            "Recycle Bin",
+            RecycleBinService.Path,
+            false,
+            true,
+            "\uE74D",
+            shellPath: RecycleBinService.Path,
+            isRecycleBin: true)
+        {
+            FileIconSize = _settings.FileIconSize
+        };
+        FolderTree.RootNodes.Add(new TreeViewNode { Content = recycleBinItem });
+        _ = LoadShellTreeIconAsync(recycleBinItem);
+    }
+
+    private void RefreshQuickAccessTree()
+    {
+        foreach (var node in FolderTree.RootNodes
+                     .Where(node => node.Content is TreeItem { IsQuickAccessEntry: true })
+                     .ToArray())
+            FolderTree.RootNodes.Remove(node);
+
+        var quickAccessNodes = new List<TreeViewNode>();
+        foreach (var location in BuildQuickAccess())
+        {
+            var isDirectory = !FileSystemService.IsRemotePath(location.Path) && Directory.Exists(location.Path);
+            var item = new TreeItem(
+                location.Name,
+                location.Path,
+                false,
+                isDirectory,
+                location.Icon,
+                isQuickAccessEntry: true,
+                otherPath: location.OtherPath,
+                canRemove: location.CanRemove)
+            {
+                FileIconSize = _settings.FileIconSize
+            };
+            quickAccessNodes.Add(new TreeViewNode
+            {
+                Content = item,
+                HasUnrealizedChildren = isDirectory
+            });
+            if (location.IconResourceIndex is int iconResourceIndex)
+                _ = LoadQuickLocationIconAsync(item, iconResourceIndex);
+            else if (isDirectory)
+                _ = LoadTreeIconAsync(item);
+        }
+
+        var computerIndex = _computerRoot is null ? -1 : FolderTree.RootNodes.IndexOf(_computerRoot);
+        var insertionIndex = computerIndex < 0 ? FolderTree.RootNodes.Count : computerIndex;
+        foreach (var node in quickAccessNodes)
+            FolderTree.RootNodes.Insert(insertionIndex++, node);
+    }
+
+    private void RefreshComputerTree()
+    {
+        if (_computerRoot is null)
+            return;
+
+        var drives = DriveInfo.GetDrives().OrderBy(drive => drive.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+        var drivePaths = drives.Select(drive => drive.Name).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var currentDrivePaths = _computerRoot.Children
+            .Select(node => node.Content is TreeItem item ? item.Path : "")
+            .Where(drivePaths.Contains)
+            .ToArray();
+        if (drives.Select(drive => drive.Name).SequenceEqual(currentDrivePaths, StringComparer.OrdinalIgnoreCase))
+            return;
+
+        var additionalNodes = _computerRoot.Children
+            .Where(node => node.Content is not TreeItem item || !drivePaths.Contains(item.Path))
+            .ToArray();
+        _computerRoot.Children.Clear();
+        foreach (var drive in drives)
+        {
+            var item = new TreeItem(drive.Name, drive.Name, false, true, "\uE7F4")
+            {
+                FileIconSize = _settings.FileIconSize
+            };
+            _computerRoot.Children.Add(new TreeViewNode { Content = item, HasUnrealizedChildren = true });
+            _ = LoadDriveIconAsync(item);
+        }
+        foreach (var node in additionalNodes)
+            _computerRoot.Children.Add(node);
+        _computerRoot.HasUnrealizedChildren = false;
+        _computerRoot.IsExpanded = true;
     }
 
     private void AddBookmark(string path)
@@ -357,7 +523,7 @@ public sealed partial class MainWindow : Window
             return;
         if (!_settings.Bookmarks.Contains(path, StringComparer.OrdinalIgnoreCase))
             _settings.Bookmarks.Add(path);
-        QuickAccessList.ItemsSource = BuildQuickAccess();
+        RefreshQuickAccessTree();
         ScheduleSessionSave();
     }
 
@@ -373,7 +539,7 @@ public sealed partial class MainWindow : Window
             LeftPath = _leftTabs[_leftTabIndex],
             RightPath = _rightTabs[_rightTabIndex]
         });
-        QuickAccessList.ItemsSource = BuildQuickAccess();
+        RefreshQuickAccessTree();
         ScheduleSessionSave();
     }
 
@@ -398,11 +564,33 @@ public sealed partial class MainWindow : Window
         return true;
     }
 
-    private static void AddLocation(string name, string path, string icon, ICollection<QuickLocation> locations)
+    private static bool AddLocation(
+        string name,
+        string path,
+        string icon,
+        ICollection<QuickLocation> locations,
+        HashSet<string> knownPaths,
+        string? otherPath = null,
+        bool canRemove = false,
+        int? iconResourceIndex = null)
     {
-        if (Directory.Exists(path))
-            locations.Add(new QuickLocation(name, path, icon));
+        if (string.IsNullOrWhiteSpace(path) ||
+            (!FileSystemService.IsRemotePath(path) &&
+             !NetworkShareService.IsServerPath(path) &&
+             !Directory.Exists(path)) ||
+            !knownPaths.Add(NormalizeQuickAccessPath(path)))
+            return false;
+
+        locations.Add(new QuickLocation(name, path, icon, otherPath, canRemove, iconResourceIndex));
+        return true;
     }
+
+    private static string NormalizeQuickAccessPath(string path) =>
+        FileSystemService.IsRemotePath(path)
+            ? RemoteFileSystemService.NormalizeAddress(path).TrimEnd('/')
+            : NetworkShareService.IsServerPath(path)
+                ? path.TrimEnd('\\')
+                : Path.TrimEndingDirectorySeparator(Path.GetFullPath(path));
 
     private async void LoadPane(bool left)
     {
@@ -417,13 +605,53 @@ public sealed partial class MainWindow : Window
         var filter = (left ? _leftFilters : _rightFilters)[left ? _leftTabIndex : _rightTabIndex].Trim();
         try
         {
-            var allEntries = await AccessRetryService.RunAsync(Root.XamlRoot, path, () => FileSystemService.GetEntries(path).ToList());
+            var allEntries = RecycleBinService.IsPath(path)
+                ? await Task.Run(RecycleBinService.GetEntries)
+                : await AccessRetryService.RunAsync(Root.XamlRoot, path, () => FileSystemService.GetEntries(path).ToList());
             if (!_uiDispatcherQueue.TryEnqueue(() =>
                 {
                     if (generation == (left ? _leftLoadGeneration : _rightLoadGeneration))
                         ApplyPaneEntries(left, path, filter, allEntries);
                 }))
                 Debug.WriteLine($"Unable to display folder contents because the UI dispatcher is unavailable: {path}");
+        }
+        catch (RemoteAuthenticationException exception)
+        {
+            if (generation != (left ? _leftLoadGeneration : _rightLoadGeneration))
+                return;
+            var credentials = await PromptRemoteCredentialsAsync(path, exception.Message);
+            if (credentials is null)
+            {
+                ApplyPaneEntries(left, path, filter, null);
+                return;
+            }
+
+            RemoteFileSystemService.SetCredentials(
+                path, credentials.Value.UserName, credentials.Value.Password, credentials.Value.Persist);
+            LoadPane(left);
+        }
+        catch (RemoteHostKeyException exception)
+        {
+            if (generation != (left ? _leftLoadGeneration : _rightLoadGeneration))
+                return;
+            var confirm = new ContentDialog
+            {
+                Title = exception.KeyChanged ? "SFTP server identity changed" : "Trust SFTP server?",
+                Content = $"{exception.Message}\n\nSHA-256 fingerprint:\n{exception.Fingerprint}\n\nOnly trust this key if you verified it with the server administrator.",
+                PrimaryButtonText = exception.KeyChanged ? "Trust new key" : "Trust and connect",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Root.XamlRoot
+            };
+            if (await confirm.ShowAsync() == ContentDialogResult.Primary && exception.Fingerprint is not null)
+            {
+                RemoteFileSystemService.TrustHostKey(path, exception.Fingerprint);
+                LoadPane(left);
+            }
+            else
+            {
+                ApplyPaneEntries(left, path, filter, null);
+            }
         }
         catch (Exception exception)
         {
@@ -434,6 +662,53 @@ public sealed partial class MainWindow : Window
                 }))
                 Debug.WriteLine($"Unable to report folder load failure for {path}: {exception}");
         }
+    }
+
+    private async Task<(string UserName, string Password, bool Persist)?> PromptRemoteCredentialsAsync(
+        string path,
+        string reason)
+    {
+        var userName = new TextBox { Header = "User name" };
+        var password = new PasswordBox { Header = "Password" };
+        var persist = new CheckBox
+        {
+            Content = "Save credentials in Windows Credential Manager",
+            IsChecked = true
+        };
+        var ftpWarning = FileSystemService.IsRemotePath(path) &&
+                         RemoteFileSystemService.TryParse(path, out var remoteLocation) &&
+                         remoteLocation.IsFtp
+            ? "\n\nFTP does not encrypt credentials or file contents. Use SFTP on untrusted networks."
+            : "";
+        var content = new StackPanel { Spacing = 10, Width = 430 };
+        content.Children.Add(new TextBlock
+        {
+            Text = $"{reason}\n\nCredentials are sent only to {path} and are not stored in the application settings file.{ftpWarning}",
+            TextWrapping = TextWrapping.Wrap
+        });
+        content.Children.Add(userName);
+        content.Children.Add(password);
+        content.Children.Add(persist);
+        var dialog = new ContentDialog
+        {
+            Title = "Connect to remote server",
+            Content = content,
+            PrimaryButtonText = "Connect",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot
+        };
+        if (await dialog.ShowAsync() != ContentDialogResult.Primary)
+            return null;
+        if (string.IsNullOrWhiteSpace(userName.Text) || string.IsNullOrEmpty(password.Password))
+        {
+            await ShowMessageAsync("Credentials required", "Enter both a user name and password.");
+            return null;
+        }
+
+        var enteredPassword = password.Password;
+        password.Password = string.Empty;
+        return (userName.Text.Trim(), enteredPassword, persist.IsChecked == true);
     }
 
     private void ApplyPaneEntries(bool left, string path, string filter, List<ExplorerEntry>? allEntries)
@@ -481,7 +756,9 @@ public sealed partial class MainWindow : Window
             entry.TileSize = GetIconSize(left);
             ApplyItemTypography(entry);
             entries.Add(entry);
-            if (!entry.IsArchiveEntry)
+            if (entry.IsRecycleBinEntry)
+                _ = LoadShellEntryIconAsync(entry);
+            else if (!entry.IsArchiveEntry)
                 _ = LoadEntryIconAsync(entry);
         }
         var selectedPaths = (left ? _leftTabSelectedPaths : _rightTabSelectedPaths)[tabIndex];
@@ -498,6 +775,11 @@ public sealed partial class MainWindow : Window
     {
         var segments = left ? LeftBreadcrumbSegments : RightBreadcrumbSegments;
         segments.Children.Clear();
+        if (RecycleBinService.IsPath(path))
+        {
+            AddBreadcrumbSegment(segments, "Recycle Bin", RecycleBinService.Path);
+            return;
+        }
         if (FileSystemService.IsArchivePath(path))
         {
             var (archive, entry) = FileSystemService.SplitArchivePath(path);
@@ -508,6 +790,23 @@ public sealed partial class MainWindow : Window
             {
                 archivePath = string.IsNullOrEmpty(archivePath) ? part : $"{archivePath}/{part}";
                 AddBreadcrumbSegment(segments, part, FileSystemService.ArchivePath(archive, archivePath));
+            }
+            return;
+        }
+        if (NetworkShareService.IsServerPath(path))
+        {
+            AddBreadcrumbSegment(segments, path.TrimEnd('\\'), path);
+            return;
+        }
+        if (RemoteFileSystemService.TryParse(path, out var remoteLocation))
+        {
+            var remoteRoot = RemoteFileSystemService.GetRootPath(path);
+            AddBreadcrumbSegment(segments, $"{remoteLocation.Scheme}://{remoteLocation.Host}", remoteRoot);
+            var currentRemotePath = remoteRoot;
+            foreach (var part in remoteLocation.Path.Split('/', StringSplitOptions.RemoveEmptyEntries))
+            {
+                currentRemotePath = FileSystemService.CombinePath(currentRemotePath, part);
+                AddBreadcrumbSegment(segments, part, currentRemotePath);
             }
             return;
         }
@@ -563,6 +862,29 @@ public sealed partial class MainWindow : Window
         address.Focus(FocusState.Programmatic);
     }
 
+    private void CopyPanePathToOther_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not Button { Tag: string pane })
+            return;
+
+        var sourceLeft = pane == "Left";
+        var sourcePath = sourceLeft
+            ? _leftTabs[_leftTabIndex]
+            : _rightTabs[_rightTabIndex];
+        NavigatePane(!sourceLeft, sourcePath);
+    }
+
+    private void SwapPanePaths_Click(object sender, RoutedEventArgs e)
+    {
+        var leftPath = _leftTabs[_leftTabIndex];
+        var rightPath = _rightTabs[_rightTabIndex];
+        if (string.Equals(leftPath, rightPath, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        NavigatePane(true, rightPath);
+        NavigatePane(false, leftPath);
+    }
+
     private void Address_TextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs args)
     {
         if (args.Reason != AutoSuggestionBoxTextChangeReason.UserInput)
@@ -577,6 +899,16 @@ public sealed partial class MainWindow : Window
 
         try
         {
+            if (FileSystemService.IsRemotePath(text) || text.StartsWith("ftp:", StringComparison.OrdinalIgnoreCase) ||
+                text.StartsWith("sftp:", StringComparison.OrdinalIgnoreCase))
+            {
+                sender.ItemsSource = _settings.RecentLocations
+                    .Where(candidate => candidate.StartsWith(text, StringComparison.OrdinalIgnoreCase))
+                    .Take(20)
+                    .ToList();
+                return;
+            }
+
             var expanded = Environment.ExpandEnvironmentVariables(text);
             var parent = Path.GetDirectoryName(expanded);
             var partial = Path.GetFileName(expanded);
@@ -612,7 +944,10 @@ public sealed partial class MainWindow : Window
             return;
         var left = ReferenceEquals(sender, LeftAddress);
         SetActivePane(left);
-        Navigate(Environment.ExpandEnvironmentVariables(path));
+        if (!path.StartsWith("ftp:", StringComparison.OrdinalIgnoreCase) &&
+            !path.StartsWith("sftp:", StringComparison.OrdinalIgnoreCase))
+            path = Environment.ExpandEnvironmentVariables(path);
+        Navigate(path);
     }
 
     private void ShowPaneLoadError(bool left, string path, Exception exception)
@@ -659,6 +994,12 @@ public sealed partial class MainWindow : Window
     {
         if (string.IsNullOrWhiteSpace(path))
             return false;
+        if (FileSystemService.IsRemotePath(path))
+            return true;
+        if (NetworkShareService.IsServerPath(path))
+            return true;
+        if (RecycleBinService.IsPath(path))
+            return true;
         if (!FileSystemService.IsArchivePath(path))
             return Directory.Exists(path);
 
@@ -766,8 +1107,12 @@ public sealed partial class MainWindow : Window
                 Content = label,
                 Tag = tabIndex,
                 Padding = new Thickness(8, 3, 5, 3),
-                Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent)
+                Background = new Microsoft.UI.Xaml.Media.SolidColorBrush(Microsoft.UI.Colors.Transparent),
+                AllowDrop = true
             };
+            var tabPath = tabs[index];
+            button.DragOver += (_, args) => Tab_DragOver(tabPath, args);
+            button.Drop += async (_, args) => await Tab_DropAsync(tabPath, args);
             var close = new Button
             {
                 Content = "\uE8BB",
@@ -1092,31 +1437,43 @@ public sealed partial class MainWindow : Window
 
     private async void RefreshTree(string path, List<ExplorerEntry>? entries = null)
     {
+        if (RecycleBinService.IsPath(path) ||
+            FileSystemService.IsRemotePath(path) ||
+            NetworkShareService.IsServerPath(path))
+            return;
+
         var refreshVersion = ++_treeRefreshVersion;
-        FolderTree.RootNodes.Clear();
         try
         {
             var pathItems = BuildTreePath(path);
             if (pathItems.Count == 0)
                 return;
+            foreach (var item in pathItems)
+                item.FileIconSize = _settings.FileIconSize;
 
-            var rootItem = pathItems[0];
-            var root = new TreeViewNode { Content = rootItem, IsExpanded = true };
-            FolderTree.RootNodes.Add(root);
-            if (!rootItem.IsArchive)
-                _ = LoadTreeIconAsync(rootItem);
+            var drivePath = pathItems[0].Path;
+            var parent = _computerRoot?.Children.FirstOrDefault(node =>
+                node.Content is TreeItem item &&
+                string.Equals(item.Path, drivePath, StringComparison.OrdinalIgnoreCase));
+            if (parent is null && _computerRoot is not null)
+            {
+                var driveItem = new TreeItem(drivePath, drivePath, false, true, "\uE7F4")
+                {
+                    FileIconSize = _settings.FileIconSize
+                };
+                parent = new TreeViewNode { Content = driveItem, HasUnrealizedChildren = true };
+                _computerRoot.Children.Add(parent);
+                _ = LoadDriveIconAsync(driveItem);
+            }
+            if (parent is null)
+                return;
 
-            var parent = root;
             for (var index = 1; index < pathItems.Count; index++)
             {
-                var parentPath = ((TreeItem)parent.Content).Path;
-                var children = await AccessRetryService.RunAsync(Root.XamlRoot, parentPath,
-                    () => FileSystemService.GetEntries(parentPath).ToList());
-                if (children is null || refreshVersion != _treeRefreshVersion)
+                var parentItem = (TreeItem)parent.Content;
+                if (!await EnsureTreeChildrenAsync(parent, parentItem, refreshVersion))
                     return;
 
-                AddTreeFolders(parent, children);
-                parent.HasUnrealizedChildren = false;
                 var nextItem = pathItems[index];
                 var nextNode = parent.Children.FirstOrDefault(node =>
                     node.Content is TreeItem child &&
@@ -1208,6 +1565,11 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            if (item.IsComputerRoot)
+            {
+                RefreshComputerTree();
+                return;
+            }
             var children = await AccessRetryService.RunAsync(Root.XamlRoot, item.Path,
                 () => FileSystemService.GetEntries(item.Path).ToList());
             if (refreshVersion != _treeRefreshVersion)
@@ -1218,6 +1580,7 @@ public sealed partial class MainWindow : Window
                 return;
             }
             AddTreeFolders(parent, children);
+            parent.HasUnrealizedChildren = false;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or InvalidDataException)
         {
@@ -1229,6 +1592,21 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private async Task<bool> EnsureTreeChildrenAsync(TreeViewNode parent, TreeItem item, int refreshVersion)
+    {
+        if (!parent.HasUnrealizedChildren)
+            return true;
+
+        var children = await AccessRetryService.RunAsync(Root.XamlRoot, item.Path,
+            () => FileSystemService.GetEntries(item.Path).ToList());
+        if (children is null || refreshVersion != _treeRefreshVersion)
+            return false;
+        AddTreeFolders(parent, children);
+        parent.HasUnrealizedChildren = false;
+        parent.IsExpanded = true;
+        return true;
+    }
+
     private void AddTreeFolders(TreeViewNode parent, IEnumerable<ExplorerEntry> entries)
     {
         foreach (var entry in entries)
@@ -1238,7 +1616,15 @@ public sealed partial class MainWindow : Window
                 continue;
 
             var path = isArchiveContainer ? FileSystemService.ArchivePath(entry.FullPath) : entry.FullPath;
-            var treeItem = new TreeItem(entry.Name, path, FileSystemService.IsArchivePath(path), true);
+            if (parent.Children.Any(node =>
+                    node.Content is TreeItem child &&
+                    string.Equals(child.Path, path, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            var treeItem = new TreeItem(entry.Name, path, FileSystemService.IsArchivePath(path), true)
+            {
+                FileIconSize = _settings.FileIconSize
+            };
             var node = new TreeViewNode
             {
                 Content = treeItem,
@@ -1252,12 +1638,36 @@ public sealed partial class MainWindow : Window
 
     private async Task LoadEntryIconAsync(ExplorerEntry entry)
     {
+        if (FileSystemService.IsRemotePath(entry.FullPath))
+            return;
         entry.IconImage = await ShellIconService.LoadFileIconAsync(entry.FullPath, entry.IsDirectory);
+    }
+
+    private async Task LoadShellEntryIconAsync(ExplorerEntry entry)
+    {
+        entry.IconImage = await ShellIconService.LoadShellItemIconAsync(entry.FullPath);
     }
 
     private async Task LoadTreeIconAsync(TreeItem item)
     {
         item.IconImage = await ShellIconService.LoadFileIconAsync(item.Path, item.IsDirectory);
+    }
+
+    private async Task LoadDriveIconAsync(TreeItem item)
+    {
+        item.IconImage = await ShellIconService.LoadFileIconAsync(item.Path, isDirectory: true);
+    }
+
+    private async Task LoadQuickLocationIconAsync(TreeItem item, int iconResourceIndex)
+    {
+        var shell32Path = Path.Combine(Environment.SystemDirectory, "shell32.dll");
+        item.IconImage = await ShellIconService.LoadIconResourceAsync(shell32Path, iconResourceIndex);
+    }
+
+    private static async Task LoadShellTreeIconAsync(TreeItem item)
+    {
+        if (item.ShellPath is not null)
+            item.IconImage = await ShellIconService.LoadShellItemIconAsync(item.ShellPath);
     }
 
     private async Task LoadPhysicalDrivesAsync(bool reportErrors = true)
@@ -1269,17 +1679,22 @@ public sealed partial class MainWindow : Window
         {
             var drives = await Task.Run(PhysicalDriveService.GetDrives);
             if (string.Equals(GetDriveSnapshot(drives), GetDriveSnapshot(_physicalDrives), StringComparison.Ordinal))
+            {
+                RefreshComputerTree();
                 return;
+            }
             _physicalDrives.Clear();
             foreach (var drive in drives)
             {
                 _physicalDrives.Add(drive);
                 foreach (var partition in drive.Partitions)
                 {
+                    partition.FileIconSize = _settings.FileIconSize;
                     if (partition.Path is not null)
                         _ = LoadPartitionIconAsync(partition);
                 }
             }
+            RefreshComputerTree();
 
             if (reportErrors && drives.Count == 0)
                 StatusText.Text = "No physical drives were found.";
@@ -1298,9 +1713,9 @@ public sealed partial class MainWindow : Window
 
     private static string GetDriveSnapshot(IEnumerable<PhysicalDrive> drives) =>
         string.Join("|", drives.OrderBy(drive => drive.DiskIndex).Select(drive =>
-            $"{drive.DiskIndex}:{drive.Model}:{drive.SizeBytes}:{drive.IsRemovable}:" +
+            $"{drive.DiskIndex}:{drive.Model}:{drive.SizeBytes}:{drive.IsRemovable}:{drive.IsNetwork}:" +
             string.Join(",", drive.Partitions.OrderBy(partition => partition.Name).Select(partition =>
-                $"{partition.Name}:{partition.Path}:{partition.ByteOffset}:{partition.ByteLength}"))));
+                $"{partition.Name}:{partition.Path}:{partition.Details}:{partition.ByteOffset}:{partition.ByteLength}"))));
 
     private static async Task LoadPartitionIconAsync(DrivePartition partition)
     {
@@ -1328,7 +1743,7 @@ public sealed partial class MainWindow : Window
         context ??= target.DataContext;
 
         var menu = new MenuFlyout();
-        if (context is DrivePartition partition)
+        if (context is DrivePartition partition && !partition.IsNetwork)
         {
             AddContextAction(menu, "View partition as raw bytes (read-only)",
                 () => OpenRawRegionAsync(partition.RawDevicePath, partition.ByteOffset,
@@ -1337,7 +1752,7 @@ public sealed partial class MainWindow : Window
             if (partition.IsRemovable && !string.IsNullOrWhiteSpace(partition.Path))
                 AddContextAction(menu, "Eject removable drive", () => EjectDriveAsync(partition.Path, partition.Name));
         }
-        else if (context is PhysicalDrive drive)
+        else if (context is PhysicalDrive drive && !drive.IsNetwork)
         {
             AddContextAction(menu, "View physical drive as raw bytes (read-only)",
                 () => OpenRawRegionAsync($@"\\.\PhysicalDrive{drive.DiskIndex}", 0,
@@ -1387,13 +1802,51 @@ public sealed partial class MainWindow : Window
             Navigate(partition.Path);
     }
 
-    private void Navigate(string path, bool recordHistory = true)
+    private void AddLocation_Click(object sender, RoutedEventArgs e)
     {
-        if (recordHistory && !string.Equals(path, CurrentPath, StringComparison.OrdinalIgnoreCase))
+        if (sender is not FrameworkElement target)
+            return;
+        var menu = new MenuFlyout();
+        AddMenuAction(menu, "Map network drive", () => ShowNetworkDriveWizardAsync(_leftActive));
+        AddMenuAction(menu, "Connect to FTP/SFTP", () => PromptRemoteLocationAsync(_leftActive));
+        menu.ShowAt(target);
+    }
+
+    private async Task PromptRemoteLocationAsync(bool left)
+    {
+        var address = await PromptAsync(
+            "Connect to FTP/SFTP",
+            "ftp://server or sftp://server",
+            "ftp://");
+        if (string.IsNullOrWhiteSpace(address))
+            return;
+        address = FileSystemService.NormalizeLocation(address);
+        if (!RemoteFileSystemService.IsRemotePath(address))
         {
-            var back = _leftActive ? _leftBack : _rightBack;
-            var forward = _leftActive ? _leftForward : _rightForward;
-            AddHistory(back, CurrentPath);
+            await ShowMessageAsync(
+                "Invalid remote address",
+                "Enter an FTP or SFTP address such as ftp://192.168.0.1 or sftp://server:22/folder.");
+            return;
+        }
+
+        SetActivePane(left);
+        Navigate(address);
+    }
+
+    private void Navigate(string path, bool recordHistory = true)
+        => NavigatePane(_leftActive, path, recordHistory);
+
+    private void NavigatePane(bool left, string path, bool recordHistory = true)
+    {
+        path = FileSystemService.NormalizeLocation(path);
+        var tabs = left ? _leftTabs : _rightTabs;
+        var tabIndex = left ? _leftTabIndex : _rightTabIndex;
+        var currentPath = tabs[tabIndex];
+        if (recordHistory && !string.Equals(path, currentPath, StringComparison.OrdinalIgnoreCase))
+        {
+            var back = left ? _leftBack : _rightBack;
+            var forward = left ? _leftForward : _rightForward;
+            AddHistory(back, currentPath);
             forward.Clear();
         }
         var recentLocations = _settings.RecentLocations;
@@ -1403,13 +1856,10 @@ public sealed partial class MainWindow : Window
             recentLocations.Insert(0, path);
             if (recentLocations.Count > 20)
                 recentLocations.RemoveRange(20, recentLocations.Count - 20);
-            QuickAccessList.ItemsSource = BuildQuickAccess();
+            RefreshQuickAccessTree();
         }
-        if (_leftActive)
-            _leftTabs[_leftTabIndex] = path;
-        else
-            _rightTabs[_rightTabIndex] = path;
-        LoadPane(_leftActive);
+        tabs[tabIndex] = path;
+        LoadPane(left);
     }
 
     private void AddTab(bool left, string path)
@@ -1692,7 +2142,7 @@ public sealed partial class MainWindow : Window
             return;
 
         SetActivePane(ReferenceEquals(list, LeftList));
-        if (list.IsMultiSelectCheckBoxEnabled || !e.GetCurrentPoint(list).Properties.IsLeftButtonPressed)
+        if (!e.GetCurrentPoint(list).Properties.IsLeftButtonPressed)
             return;
 
         var element = e.OriginalSource as DependencyObject;
@@ -1704,10 +2154,27 @@ public sealed partial class MainWindow : Window
             return;
         if (element is not ListViewItem container)
         {
-            _lastPointerClickPath = null;
-            list.SelectedItems.Clear();
+            if (!list.IsMultiSelectCheckBoxEnabled)
+            {
+                _lastPointerClickPath = null;
+                list.SelectedItems.Clear();
+            }
             return;
         }
+
+        var entry = container.DataContext as ExplorerEntry ?? container.Content as ExplorerEntry;
+        if (entry is null)
+            return;
+
+        _internalDragList = list;
+        _internalDragPath = entry.FullPath;
+        _internalDragStart = e.GetCurrentPoint(Root).Position;
+        _internalDragSources = [];
+        _internalDragDestination = null;
+        _internalDragStarted = false;
+
+        if (list.IsMultiSelectCheckBoxEnabled)
+            return;
 
         var controlDown = (GetKeyState(0x11) & 0x8000) != 0;
         var shiftDown = (GetKeyState(0x10) & 0x8000) != 0;
@@ -1716,10 +2183,6 @@ public sealed partial class MainWindow : Window
             _lastPointerClickPath = null;
             return;
         }
-
-        var entry = container.DataContext as ExplorerEntry ?? container.Content as ExplorerEntry;
-        if (entry is null)
-            return;
 
         var now = Stopwatch.GetTimestamp();
         var isRenameClick = _lastPointerClickLeft == ReferenceEquals(list, LeftList) &&
@@ -1766,7 +2229,29 @@ public sealed partial class MainWindow : Window
         }
 
         var selected = list.SelectedItems.Cast<ExplorerEntry>().ToArray();
-        if (entry is not null && selected.Length > 0 && selected.All(item => !item.IsArchiveEntry))
+        if (entry is { IsRecycleBinEntry: true })
+        {
+            try
+            {
+                var command = ShellContextMenuService.Show(
+                    WindowNative.GetWindowHandle(this),
+                    selected.Select(item => item.FullPath).ToArray(),
+                    showPaste: false,
+                    includeExplorerPlusPlusCommands: false);
+                if (command == 0xFFFFFFFF)
+                    LoadPane(left);
+                e.Handled = true;
+                return;
+            }
+            catch (Exception exception) when (exception is COMException or InvalidOperationException or ArgumentException)
+            {
+                _ = ShowMessageAsync("Unable to show Windows context menu", exception.Message);
+                e.Handled = true;
+                return;
+            }
+        }
+        if (entry is not null && selected.Length > 0 &&
+            selected.All(item => !item.IsArchiveEntry && !FileSystemService.IsRemotePath(item.FullPath)))
         {
             try
             {
@@ -1783,7 +2268,9 @@ public sealed partial class MainWindow : Window
                 else if (command == ShellContextMenuService.PasteCommand)
                     _ = PasteToAsync(CurrentPath);
                 else if (command == ShellContextMenuService.DeleteCommand)
-                    _ = DeleteEntriesAsync(selected, permanent: false);
+                    _ = DeleteEntriesAsync(selected, permanent: true);
+                else if (command == ShellContextMenuService.ConvertImagesToPngCommand)
+                    _ = ConvertSelectedImagesToPngAsync(selected);
                 else if (command == ShellContextMenuService.AdminCommandPromptCommand)
                 {
                     var workingDirectory = selected.Length == 1 && Directory.Exists(selected[0].FullPath)
@@ -1886,6 +2373,8 @@ public sealed partial class MainWindow : Window
         Grid settingsRoot = null!;
         var settingsSaved = false;
         var showingTextCategory = true;
+        var showingBackgroundCategory = false;
+        var showingDesktopCategory = false;
         var selectedFontColor = ParseFontColor(_settings.ItemFontColor);
         var selectedBackgroundTint = ParseFontColor(_settings.BackgroundTintColor);
         var selectedFallbackColor = ParseFontColor(_settings.BackgroundFallbackColor);
@@ -1900,6 +2389,17 @@ public sealed partial class MainWindow : Window
             LargeChange = 2,
             SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
             Width = 150
+        };
+        var fileIconSizeInput = new NumberBox
+        {
+            Header = "File and folder icon size",
+            Value = _settings.FileIconSize,
+            Minimum = 8,
+            Maximum = 64,
+            SmallChange = 1,
+            LargeChange = 4,
+            SpinButtonPlacementMode = NumberBoxSpinButtonPlacementMode.Inline,
+            Width = 190
         };
         var previewText = new TextBlock
         {
@@ -2064,6 +2564,11 @@ public sealed partial class MainWindow : Window
         backgroundOptions.Children.Add(luminosityOpacitySlider);
         backgroundOptions.Children.Add(acrylicSupportNote);
 
+        var desktopLaunchToggle = new CheckBox
+        {
+            Content = "Launch ExplorerPlusPlus when the empty desktop background is double-clicked",
+            IsChecked = _settings.DesktopBackgroundDoubleClickLauncherEnabled
+        };
         void UpdateBackgroundControls()
         {
             backgroundTintButton.IsEnabled = useAcrylicBackground && acrylicSupported;
@@ -2115,6 +2620,7 @@ public sealed partial class MainWindow : Window
         Grid.SetColumn(colorControl, 2);
         typographyRow.Children.Add(colorControl);
         displayOptions.Children.Add(typographyRow);
+        displayOptions.Children.Add(fileIconSizeInput);
         displayOptions.Children.Add(new TextBlock
         {
             Text = "Preview",
@@ -2147,6 +2653,12 @@ public sealed partial class MainWindow : Window
             HorizontalContentAlignment = HorizontalAlignment.Left,
             Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 38, 43, 51))
         };
+        var desktopCategoryButton = new Button
+        {
+            Content = "Desktop",
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 38, 43, 51))
+        };
         var categories = new StackPanel
         {
             Width = 120,
@@ -2163,7 +2675,8 @@ public sealed partial class MainWindow : Window
                     Margin = new Thickness(8, 8, 0, 8)
                 },
                 textCategoryButton,
-                backgroundCategoryButton
+                backgroundCategoryButton,
+                desktopCategoryButton
             }
         };
         var content = new Grid
@@ -2215,20 +2728,52 @@ public sealed partial class MainWindow : Window
             Opacity = 0.75
         });
         backgroundPage.Children.Add(backgroundOptions);
+        var desktopPage = new StackPanel
+        {
+            Spacing = 12,
+            Padding = new Thickness(18, 8, 16, 12),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Visibility = Visibility.Collapsed
+        };
+        desktopPage.Children.Add(new TextBlock
+        {
+            Text = "Desktop",
+            FontSize = 20,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold
+        });
+        desktopPage.Children.Add(new TextBlock
+        {
+            Text = "Monitor double-clicks on empty desktop space and start ExplorerPlusPlus. When enabled, the monitor starts automatically when you sign in.",
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.75
+        });
+        desktopPage.Children.Add(desktopLaunchToggle);
         pageHost.Children.Add(textPage);
         pageHost.Children.Add(backgroundPage);
-        void SelectSettingsCategory(bool showText)
+        pageHost.Children.Add(desktopPage);
+        void SelectSettingsCategory(string category)
         {
-            showingTextCategory = showText;
-            textPage.Visibility = showText ? Visibility.Visible : Visibility.Collapsed;
-            backgroundPage.Visibility = showText ? Visibility.Collapsed : Visibility.Visible;
+            showingTextCategory = category == "Text";
+            showingBackgroundCategory = category == "Background";
+            showingDesktopCategory = category == "Desktop";
+            textPage.Visibility = showingTextCategory ? Visibility.Visible : Visibility.Collapsed;
+            backgroundPage.Visibility = showingBackgroundCategory ? Visibility.Visible : Visibility.Collapsed;
+            desktopPage.Visibility = showingDesktopCategory ? Visibility.Visible : Visibility.Collapsed;
             textCategoryButton.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(
-                255, showText ? (byte)54 : (byte)38, showText ? (byte)91 : (byte)43, showText ? (byte)128 : (byte)51));
+                255, showingTextCategory ? (byte)54 : (byte)38,
+                showingTextCategory ? (byte)91 : (byte)43, showingTextCategory ? (byte)128 : (byte)51));
             backgroundCategoryButton.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(
-                255, showText ? (byte)38 : (byte)54, showText ? (byte)43 : (byte)91, showText ? (byte)51 : (byte)128));
+                255, showingBackgroundCategory ? (byte)54 : (byte)38,
+                showingBackgroundCategory ? (byte)91 : (byte)43,
+                showingBackgroundCategory ? (byte)128 : (byte)51));
+            desktopCategoryButton.Background = new SolidColorBrush(Windows.UI.Color.FromArgb(
+                255, showingDesktopCategory ? (byte)54 : (byte)38,
+                showingDesktopCategory ? (byte)91 : (byte)43,
+                showingDesktopCategory ? (byte)128 : (byte)51));
         }
-        textCategoryButton.Click += (_, _) => SelectSettingsCategory(true);
-        backgroundCategoryButton.Click += (_, _) => SelectSettingsCategory(false);
+        textCategoryButton.Click += (_, _) => SelectSettingsCategory("Text");
+        backgroundCategoryButton.Click += (_, _) => SelectSettingsCategory("Background");
+        desktopCategoryButton.Click += (_, _) => SelectSettingsCategory("Desktop");
 
         var viewport = new ScrollViewer
         {
@@ -2290,8 +2835,8 @@ public sealed partial class MainWindow : Window
             var prompt = new ContentDialog
             {
                 Title = "Reset settings",
-                Content = $"Choose whether to reset the { (showingTextCategory ? "Text" : "Background") } category or all settings.",
-                PrimaryButtonText = $"Reset { (showingTextCategory ? "Text" : "Background") } category",
+                Content = $"Choose whether to reset the { (showingTextCategory ? "Text" : showingBackgroundCategory ? "Background" : "Desktop") } category or all settings.",
+                PrimaryButtonText = $"Reset { (showingTextCategory ? "Text" : showingBackgroundCategory ? "Background" : "Desktop") } category",
                 SecondaryButtonText = "Reset all settings",
                 CloseButtonText = "Cancel",
                 DefaultButton = ContentDialogButton.Close,
@@ -2312,11 +2857,12 @@ public sealed partial class MainWindow : Window
                 previewText.FontFamily = new FontFamily(defaults.ItemFontFamily);
                 fontSizeInput.Value = defaults.ItemFontSize;
                 previewText.FontSize = defaults.ItemFontSize;
+                fileIconSizeInput.Value = defaults.FileIconSize;
                 selectedFontColor = ParseFontColor(defaults.ItemFontColor);
                 UpdateColorButtonSwatch(fontColorButton, selectedFontColor);
                 previewText.Foreground = new SolidColorBrush(selectedFontColor);
             }
-            if (resetAll || !showingTextCategory)
+            if (resetAll || showingBackgroundCategory)
             {
                 useAcrylicBackground = defaults.UseAcrylicBackground;
                 acrylicToggle.IsChecked = useAcrylicBackground;
@@ -2330,15 +2876,19 @@ public sealed partial class MainWindow : Window
                 UpdateBackgroundControls();
                 ApplyBackgroundPreview();
             }
+            if (resetAll || showingDesktopCategory)
+                desktopLaunchToggle.IsChecked = defaults.DesktopBackgroundDoubleClickLauncherEnabled;
         };
         saveButton.Click += async (_, _) =>
         {
             if (fontFamilyInput.SelectedItem is not ComboBoxItem { Tag: string fontFamily } ||
                 !double.IsFinite(fontSizeInput.Value) ||
-                fontSizeInput.Value is < 6 or > 48)
+                fontSizeInput.Value is < 6 or > 48 ||
+                !double.IsFinite(fileIconSizeInput.Value) ||
+                fileIconSizeInput.Value is < 8 or > 64)
             {
                 await ShowSettingsMessageAsync(settingsRoot.XamlRoot,
-                    "Invalid settings", "Choose a font and a font size from 6 to 48 pixels.");
+                    "Invalid settings", "Choose a font size from 6 to 48 pixels and an icon size from 8 to 64 pixels.");
                 return;
             }
 
@@ -2350,21 +2900,32 @@ public sealed partial class MainWindow : Window
                 {
                     ItemFontFamily = fontFamily,
                     ItemFontSize = fontSizeInput.Value,
+                    FileIconSize = fileIconSizeInput.Value,
                     ItemFontColor = fontColor,
+                    Bookmarks = _settings.Bookmarks,
+                    RecentLocations = _settings.RecentLocations,
+                    FolderSets = _settings.FolderSets,
                     UseAcrylicBackground = useAcrylicBackground,
                     BackgroundTintColor = FormatFontColor(selectedBackgroundTint),
                     BackgroundTintOpacity = tintOpacitySlider.Value,
                     BackgroundLuminosityOpacity = luminosityOpacitySlider.Value,
                     BackgroundFallbackColor = FormatFontColor(selectedFallbackColor),
+                    DesktopBackgroundDoubleClickLauncherEnabled = desktopLaunchToggle.IsChecked == true,
                     Session = _settings.Session
                 };
                 ExplorerSettingsService.Save(updatedSettings);
                 _settings = updatedSettings;
+                var monitorError = DesktopBackgroundDoubleClickMonitor.ApplySetting(
+                    updatedSettings.DesktopBackgroundDoubleClickLauncherEnabled);
                 _itemFontFamily = fontFamily;
                 ApplyBackgroundMaterial(_settings);
                 ApplyItemTypography(_leftDirectoryEntries.Concat(_rightDirectoryEntries)
                     .Concat(_leftEntries).Concat(_rightEntries));
-                StatusText.Text = $"File name style set to {fontFamily}, {fontSizeInput.Value:0.#} px.";
+                ApplyFileIconSizeToNavigation(_settings.FileIconSize);
+                StatusText.Text = monitorError ??
+                    $"File name style set to {fontFamily}, {fontSizeInput.Value:0.#} px.";
+                if (monitorError is not null)
+                    await ShowSettingsMessageAsync(settingsRoot.XamlRoot, "Desktop launcher", monitorError);
                 settingsSaved = true;
                 settingsWindow.Close();
             }
@@ -2437,6 +2998,23 @@ public sealed partial class MainWindow : Window
         entry.ItemFontFamily = _itemFontFamily;
         entry.ItemFontSize = _settings.ItemFontSize;
         entry.ItemFontColor = _settings.ItemFontColor;
+        entry.FileIconSize = _settings.FileIconSize;
+    }
+
+    private void ApplyFileIconSizeToNavigation(double size)
+    {
+        void ApplyToTree(TreeViewNode node)
+        {
+            if (node.Content is TreeItem item)
+                item.FileIconSize = size;
+            foreach (var child in node.Children)
+                ApplyToTree(child);
+        }
+
+        foreach (var root in FolderTree.RootNodes)
+            ApplyToTree(root);
+        foreach (var partition in _physicalDrives.SelectMany(drive => drive.Partitions))
+            partition.FileIconSize = size;
     }
 
     private static Windows.UI.Color ParseFontColor(string color)
@@ -2547,21 +3125,46 @@ public sealed partial class MainWindow : Window
         {
             Process.Start(new ProcessStartInfo(CurrentPath) { UseShellExecute = true });
             return Task.CompletedTask;
-        }, !FileSystemService.IsArchivePath(CurrentPath));
+        }, !FileSystemService.IsArchivePath(CurrentPath) && !FileSystemService.IsRemotePath(CurrentPath));
         AddMenuAction(menu, "Open command prompt as administrator",
             () => OpenAdminCommandPromptAsync(CurrentPath),
-            !FileSystemService.IsArchivePath(CurrentPath));
+            !FileSystemService.IsArchivePath(CurrentPath) && !FileSystemService.IsRemotePath(CurrentPath));
         menu.Items.Add(new MenuFlyoutSeparator());
         var list = left ? LeftList : RightList;
         var checkBoxesItem = new ToggleMenuFlyoutItem
         {
             Text = "Item check boxes",
-            IsChecked = list.IsMultiSelectCheckBoxEnabled
+            IsChecked = left ? _leftSelectionCheckBoxesEnabled : _rightSelectionCheckBoxesEnabled
         };
         checkBoxesItem.Click += (_, _) =>
-            list.IsMultiSelectCheckBoxEnabled = checkBoxesItem.IsChecked;
+        {
+            SetPaneSelectionCheckBoxes(list, left, checkBoxesItem.IsChecked);
+        };
         menu.Items.Add(checkBoxesItem);
         menu.ShowAt(target, position);
+    }
+
+    private void SetPaneSelectionCheckBoxes(ListView list, bool left, bool enabled)
+    {
+        var selectedEntries = list.SelectedItems.OfType<ExplorerEntry>().ToArray();
+        _restoringPaneSelection = true;
+        try
+        {
+            list.IsMultiSelectCheckBoxEnabled = enabled;
+            list.SelectionMode = enabled ? ListViewSelectionMode.Multiple : ListViewSelectionMode.Extended;
+            list.SelectedItems.Clear();
+            foreach (var entry in selectedEntries)
+                list.SelectedItems.Add(entry);
+        }
+        finally
+        {
+            _restoringPaneSelection = false;
+        }
+
+        if (left)
+            _leftSelectionCheckBoxesEnabled = enabled;
+        else
+            _rightSelectionCheckBoxesEnabled = enabled;
     }
 
     private static void AddMenuAction(MenuFlyoutSubItem menu, string label, Func<Task> action, bool enabled = true)
@@ -2589,6 +3192,11 @@ public sealed partial class MainWindow : Window
         }
         if (itemType == NewItemType.Shortcut)
         {
+            if (FileSystemService.IsRemotePath(destination))
+            {
+                await ShowMessageAsync("Remote shortcut", "Shortcuts can only be created in a Windows folder.");
+                return;
+            }
             await ShowNewShortcutWizardAsync(destination);
             return;
         }
@@ -2617,10 +3225,13 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        var path = Path.Combine(destination, normalizedName);
+        var path = FileSystemService.CombinePath(destination, normalizedName);
+        var isRemote = FileSystemService.IsRemotePath(destination);
         try
         {
-            if (File.Exists(path) || Directory.Exists(path))
+            if (isRemote
+                    ? RemoteFileSystemService.Exists(path)
+                    : File.Exists(path) || Directory.Exists(path))
             {
                 await ShowMessageAsync("Item already exists", $"An item named '{normalizedName}' already exists.");
                 return;
@@ -2628,6 +3239,15 @@ public sealed partial class MainWindow : Window
 
             var created = await AccessRetryService.RunActionAsync(Root.XamlRoot, destination, () =>
             {
+                if (isRemote)
+                {
+                    if (itemType == NewItemType.Folder)
+                        RemoteFileSystemService.CreateDirectory(path);
+                    else
+                        FileSystemService.WriteFile(path, CreateNewItemBytes(itemType));
+                    return;
+                }
+
                 switch (itemType)
                 {
                     case NewItemType.Folder:
@@ -2663,7 +3283,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        if (itemType is NewItemType.PngImage or NewItemType.JpegImage or NewItemType.BmpImage)
+        if (!isRemote && itemType is (NewItemType.PngImage or NewItemType.JpegImage or NewItemType.BmpImage))
         {
             try
             {
@@ -2723,6 +3343,45 @@ public sealed partial class MainWindow : Window
     {
         using var image = new SixLabors.ImageSharp.Image<Rgba32>(1024, 768, new Rgba32(255, 255, 255, 255));
         using var output = File.Create(path);
+        CreateBlankImage(image, output, format);
+    }
+
+    private static byte[] CreateNewItemBytes(NewItemType itemType)
+    {
+        using var output = new MemoryStream();
+        switch (itemType)
+        {
+            case NewItemType.TextFile:
+                break;
+            case NewItemType.ZipFile:
+                using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true)) { }
+                break;
+            case NewItemType.PngImage:
+                CreateBlankImage(output, ImageFormat.Png);
+                break;
+            case NewItemType.JpegImage:
+                CreateBlankImage(output, ImageFormat.Jpeg);
+                break;
+            case NewItemType.BmpImage:
+                CreateBlankImage(output, ImageFormat.Bmp);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(itemType));
+        }
+        return output.ToArray();
+    }
+
+    private static void CreateBlankImage(Stream output, ImageFormat format)
+    {
+        using var image = new SixLabors.ImageSharp.Image<Rgba32>(1024, 768, new Rgba32(255, 255, 255, 255));
+        CreateBlankImage(image, output, format);
+    }
+
+    private static void CreateBlankImage(
+        SixLabors.ImageSharp.Image<Rgba32> image,
+        Stream output,
+        ImageFormat format)
+    {
         switch (format)
         {
             case ImageFormat.Png:
@@ -2769,8 +3428,10 @@ public sealed partial class MainWindow : Window
         if (entry is not null)
         {
             AddContextAction(menu, "Preview", () => PreviewEntryAsync(entry),
-                !entry.IsDirectory && (IsImage(entry.Name) || PreviewFormatRegistry.IsModel(entry.Name) || IsZip(entry.Name) || entry.IsArchiveEntry));
-            AddContextAction(menu, "Hex / entry", () => ShowHexEntryAsync(entry));
+                !FileSystemService.IsRemotePath(entry.FullPath) && !entry.IsDirectory &&
+                (IsImage(entry.Name) || PreviewFormatRegistry.IsModel(entry.Name) || IsZip(entry.Name) || entry.IsArchiveEntry));
+            AddContextAction(menu, "Hex / entry", () => ShowHexEntryAsync(entry),
+                !FileSystemService.IsRemotePath(entry.FullPath));
             menu.Items.Add(new MenuFlyoutSeparator());
             AddContextAction(menu, "Copy", () => { SetClipboardForSelection(cut: false); return Task.CompletedTask; });
             AddContextAction(menu, "Cut", () => { SetClipboardForSelection(cut: true); return Task.CompletedTask; },
@@ -2781,10 +3442,16 @@ public sealed partial class MainWindow : Window
             var workingDirectory = Directory.Exists(entry.FullPath) ? entry.FullPath : CurrentPath;
             AddContextAction(menu, "Open command prompt as administrator",
                 () => OpenAdminCommandPromptAsync(workingDirectory),
-                !FileSystemService.IsArchivePath(CurrentPath));
+                !FileSystemService.IsArchivePath(CurrentPath) && !FileSystemService.IsRemotePath(CurrentPath));
         }
 
         AddContextAction(menu, "Paste", () => PasteToAsync(CurrentPath));
+        var selectedImages = list.SelectedItems.Cast<ExplorerEntry>()
+            .Where(item => !item.IsDirectory && !item.IsArchiveEntry && IsImage(item.Name))
+            .ToArray();
+        if (selectedImages.Length > 0)
+            AddContextAction(menu, "Convert selected images to PNG",
+                () => ConvertSelectedImagesToPngAsync(selectedImages));
         if (entry is not null)
         {
             AddContextAction(menu, "Rename", () => RenameEntryAsync(entry),
@@ -2853,8 +3520,12 @@ public sealed partial class MainWindow : Window
 
     private void ExplorerList_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_restoringPaneSelection || sender is not ListView list)
+        if (sender is not ListView list)
             return;
+
+        if (_restoringPaneSelection)
+            return;
+
         var left = ReferenceEquals(list, LeftList);
         var selectedPaths = left ? _leftTabSelectedPaths : _rightTabSelectedPaths;
         var index = left ? _leftTabIndex : _rightTabIndex;
@@ -2906,7 +3577,6 @@ public sealed partial class MainWindow : Window
             }
             return;
         }
-
         var controlDown = (GetKeyState(0x11) & 0x8000) != 0;
         var shiftDown = (GetKeyState(0x10) & 0x8000) != 0;
         var altDown = (GetKeyState(0x12) & 0x8000) != 0;
@@ -2998,7 +3668,8 @@ public sealed partial class MainWindow : Window
         {
             "New tab", "Duplicate tab", "Close tab", "Reopen closed tab", "Move tab to other pane",
             "Bookmark current folder", "Save current folder pair", "Sort by name", "Sort by type",
-            "Sort by size", "Sort by modified date", "Select by pattern", "Toggle single / dual pane",
+            "Sort by size", "Sort by modified date", "Select by pattern", "Convert selected images to PNG",
+            "Toggle single / dual pane",
             "Focus filter", "Edit current path"
         };
         var search = new TextBox { PlaceholderText = "Search commands", Margin = new Thickness(0, 0, 0, 8) };
@@ -3045,6 +3716,9 @@ public sealed partial class MainWindow : Window
             case "Sort by size": SetSort(_leftActive, "Size"); break;
             case "Sort by modified date": SetSort(_leftActive, "Modified"); break;
             case "Select by pattern": await SelectEntriesByPatternAsync(); break;
+            case "Convert selected images to PNG":
+                await ConvertSelectedImagesToPngAsync(ActiveList.SelectedItems.Cast<ExplorerEntry>().ToArray());
+                break;
             case "Toggle single / dual pane": ViewModeButton_Click(SinglePaneButton, new RoutedEventArgs()); break;
             case "Focus filter": SearchBox.Focus(FocusState.Programmatic); SearchBox.SelectAll(); break;
             case "Edit current path": AddressEdit_Click(_leftActive ? LeftAddressButton : RightAddressButton, new RoutedEventArgs()); break;
@@ -3104,7 +3778,10 @@ public sealed partial class MainWindow : Window
 
     private void LoadEntryPreviewIfNeeded(ContainerContentChangingEventArgs args, bool left)
     {
-        if (args.InRecycleQueue || GetViewIndex(left) != 2 || args.Item is not ExplorerEntry entry)
+        if (args.Item is not ExplorerEntry entry || entry.IsRecycleBinEntry)
+            return;
+
+        if (args.InRecycleQueue || GetViewIndex(left) != 2)
             return;
         var size = (int)GetIconSize(left);
         if (entry.PreviewSizeLoaded == size)
@@ -3117,20 +3794,26 @@ public sealed partial class MainWindow : Window
     {
         try
         {
-            var isImage = PreviewFormatRegistry.IsImage(entry.Name) && !entry.IsArchiveEntry;
-            if (isImage)
+            if (FileSystemService.IsRemotePath(entry.FullPath))
             {
-                var bytes = await AccessRetryService.RunAsync(Root.XamlRoot, entry.FullPath,
-                    () => PreviewFormatRegistry.DecodeImage(entry.FullPath, size));
-                if (bytes is not null)
-                    entry.PreviewImage = await CreateBitmapSourceAsync(bytes);
+                entry.PreviewText = "Remote preview unavailable";
+                return;
             }
-
-            if (!isImage && !entry.IsDirectory && !entry.IsArchiveEntry)
+            if (!entry.IsDirectory && !entry.IsArchiveEntry)
             {
-                var text = await AccessRetryService.RunAsync(Root.XamlRoot, entry.FullPath,
-                    () => PreviewThumbnailService.LoadContentPreviewAsync(entry.FullPath).GetAwaiter().GetResult());
-                entry.PreviewText = text ?? "Preview unavailable";
+                var preview = await PreviewThumbnailService.LoadAsync(entry.FullPath, size);
+                if (preview is not null)
+                {
+                    entry.PreviewImage = preview;
+                    return;
+                }
+
+                if (!PreviewFormatRegistry.IsImage(entry.Name))
+                {
+                    var text = await AccessRetryService.RunAsync(Root.XamlRoot, entry.FullPath,
+                        () => PreviewThumbnailService.LoadContentPreviewAsync(entry.FullPath).GetAwaiter().GetResult());
+                    entry.PreviewText = text ?? "Preview unavailable";
+                }
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or ArgumentException or NotSupportedException or SixLabors.ImageSharp.ImageFormatException)
@@ -3145,56 +3828,92 @@ public sealed partial class MainWindow : Window
     [DllImport("user32.dll")]
     private static extern uint GetDoubleClickTime();
 
-    private void QuickAccessList_ItemClick(object sender, ItemClickEventArgs e)
-    {
-        if (e.ClickedItem is QuickLocation location)
-        {
-            if (location.OtherPath is null)
-            {
-                Navigate(location.Path);
-                return;
-            }
-
-            var wasLeftActive = _leftActive;
-            SetActivePane(true);
-            Navigate(location.Path);
-            SetActivePane(false);
-            Navigate(location.OtherPath);
-            SetActivePane(wasLeftActive);
-        }
-    }
-
-    private void QuickAccessList_RightTapped(object sender, RightTappedRoutedEventArgs e)
+    private void FolderTreeItem_RightTapped(object sender, RightTappedRoutedEventArgs e)
     {
         var element = e.OriginalSource as DependencyObject;
-        while (element is not null &&
-               (element is not FrameworkElement { DataContext: QuickLocation }))
+        TreeItem? item = null;
+        FrameworkElement? target = null;
+        while (element is not null)
+        {
+            if (element is FrameworkElement frameworkElement)
+            {
+                item = frameworkElement.DataContext switch
+                {
+                    TreeViewNode node => node.Content as TreeItem,
+                    TreeItem treeItem => treeItem,
+                    _ => null
+                };
+                if (item is not null)
+                {
+                    target = frameworkElement;
+                    break;
+                }
+            }
             element = VisualTreeHelper.GetParent(element);
-        if (element is not FrameworkElement { DataContext: QuickLocation location } target)
+        }
+        if (item is null || target is null)
             return;
 
-        var menu = new MenuFlyout();
-        if (location.OtherPath is null)
+        var shellContextPath = item.ShellPath ?? item.Path;
+        if (!item.IsArchive &&
+            (item.ShellPath is not null || File.Exists(shellContextPath) || Directory.Exists(shellContextPath)))
         {
-            AddMenuAction(menu, "Remove favorite", () =>
+            try
             {
-                _settings.Bookmarks.RemoveAll(path => string.Equals(path, location.Path, StringComparison.OrdinalIgnoreCase));
-                QuickAccessList.ItemsSource = BuildQuickAccess();
-                ScheduleSessionSave();
-                return Task.CompletedTask;
-            }, _settings.Bookmarks.Contains(location.Path, StringComparer.OrdinalIgnoreCase));
+                var command = ShellContextMenuService.Show(
+                    WindowNative.GetWindowHandle(this),
+                    [shellContextPath],
+                    showPaste: false,
+                    showRemoveFavorite: item.IsQuickAccessEntry && item.CanRemove,
+                    includeExplorerPlusPlusCommands: false);
+                if (command == ShellContextMenuService.RemoveFavoriteCommand)
+                {
+                    if (item.OtherPath is null)
+                    {
+                        _settings.Bookmarks.RemoveAll(path =>
+                            string.Equals(path, item.Path, StringComparison.OrdinalIgnoreCase));
+                    }
+                    else
+                    {
+                        _settings.FolderSets.RemoveAll(set =>
+                            string.Equals(set.Name, item.Name, StringComparison.OrdinalIgnoreCase));
+                    }
+                    RefreshQuickAccessTree();
+                    ScheduleSessionSave();
+                }
+                else if (command == 0xFFFFFFFF)
+                {
+                    RefreshTree(CurrentPath);
+                    RefreshComputerTree();
+                }
+                e.Handled = true;
+                return;
+            }
+            catch (Exception exception) when (exception is COMException or InvalidOperationException or ArgumentException)
+            {
+                _ = ShowMessageAsync("Unable to show Windows context menu", exception.Message);
+                e.Handled = true;
+                return;
+            }
         }
-        else
+
+        if (item is { IsQuickAccessEntry: true, CanRemove: true })
         {
-            AddMenuAction(menu, "Remove folder set", () =>
+            var menu = new MenuFlyout();
+            AddMenuAction(menu, item.OtherPath is null ? "Remove favorite" : "Remove folder set", () =>
             {
-                _settings.FolderSets.RemoveAll(set => set.Name == location.Name);
-                QuickAccessList.ItemsSource = BuildQuickAccess();
+                if (item.OtherPath is null)
+                    _settings.Bookmarks.RemoveAll(path =>
+                        string.Equals(path, item.Path, StringComparison.OrdinalIgnoreCase));
+                else
+                    _settings.FolderSets.RemoveAll(set =>
+                        string.Equals(set.Name, item.Name, StringComparison.OrdinalIgnoreCase));
+                RefreshQuickAccessTree();
                 ScheduleSessionSave();
                 return Task.CompletedTask;
             });
+            menu.ShowAt(target, e.GetPosition(target));
         }
-        menu.ShowAt(target, e.GetPosition(target));
         e.Handled = true;
     }
 
@@ -3206,7 +3925,24 @@ public sealed partial class MainWindow : Window
             TreeItem treeItem => treeItem,
             _ => null
         };
-        if (item is not null)
+        if (item is { IsQuickAccessEntry: true })
+        {
+            if (item.OtherPath is null)
+            {
+                Navigate(item.Path);
+                return;
+            }
+
+            var wasLeftActive = _leftActive;
+            SetActivePane(true);
+            Navigate(item.Path);
+            SetActivePane(false);
+            Navigate(item.OtherPath);
+            SetActivePane(wasLeftActive);
+        }
+        else if (item is { IsRecycleBin: true })
+            Navigate(RecycleBinService.Path);
+        else if (item is { IsDirectory: true })
         {
             Navigate(item.Path);
         }
@@ -3304,7 +4040,18 @@ public sealed partial class MainWindow : Window
     {
         if (entry is null)
             return;
-        if (entry.IsDirectory)
+        if (entry.IsRecycleBinEntry)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(entry.FullPath) { UseShellExecute = true });
+            }
+            catch (Exception exception) when (exception is InvalidOperationException or System.ComponentModel.Win32Exception or COMException or ArgumentException)
+            {
+                await ShowMessageAsync("Unable to open Recycle Bin item", exception.Message);
+            }
+        }
+        else if (entry.IsDirectory)
             Navigate(entry.FullPath);
         else if (!entry.IsArchiveEntry)
             await LaunchFileAsync(entry.FullPath);
@@ -3316,9 +4063,25 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            if (FileSystemService.IsRemotePath(path))
+            {
+                await ShowMessageAsync("Remote file", "Copy the remote file to a local folder before opening it.");
+                return;
+            }
+            if (Path.GetExtension(path).Equals(".lnk", StringComparison.OrdinalIgnoreCase))
+            {
+                Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+                return;
+            }
+
             var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(path);
             if (!await Windows.System.Launcher.LaunchFileAsync(file))
-                await ShowMessageAsync("Unable to open file", $"Windows could not find an application associated with:\n{path}");
+            {
+                if (PreviewFormatRegistry.IsTexture(path))
+                    await PreviewImageAsync(path);
+                else
+                    await ShowMessageAsync("Unable to open file", $"Windows could not find an application associated with:\n{path}");
+            }
         }
         catch (UnauthorizedAccessException)
         {
@@ -3368,11 +4131,14 @@ public sealed partial class MainWindow : Window
                 try
                 {
                     var bytes = await AccessRetryService.RunAsync(Root.XamlRoot, path,
-                        () => PreviewFormatRegistry.DecodeImage(path, 1600));
-                    if (bytes is not null)
-                        source = await CreateBitmapSourceAsync(bytes);
+                        () => PreviewFormatRegistry.DecodeImage(path, 1600) ??
+                            throw new InvalidDataException("No image decoder is available for this file."));
+                    if (bytes is null)
+                        return;
+                    source = await CreateBitmapSourceAsync(bytes);
                 }
-                catch (Exception exception) when (exception is InvalidDataException or ArgumentException or NotSupportedException or SixLabors.ImageSharp.ImageFormatException)
+                catch (Exception exception) when (!PreviewFormatRegistry.IsTexture(path) &&
+                    (exception is InvalidDataException or ArgumentException or NotSupportedException or SixLabors.ImageSharp.ImageFormatException))
                 {
                 }
             }
@@ -3400,7 +4166,8 @@ public sealed partial class MainWindow : Window
             };
             await dialog.ShowAsync();
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or
+            NotSupportedException or SixLabors.ImageSharp.ImageFormatException)
         {
             await ShowMessageAsync("Unable to preview image", exception.Message);
         }
@@ -3593,6 +4360,297 @@ public sealed partial class MainWindow : Window
     private void CopyButton_Click(object sender, RoutedEventArgs e) => SetClipboard(cut: false);
     private void CutButton_Click(object sender, RoutedEventArgs e) => SetClipboard(cut: true);
 
+    private void InternalDrag_PointerMoved(object sender, PointerRoutedEventArgs e)
+    {
+        if (_internalDragList is null)
+            return;
+
+        var point = e.GetCurrentPoint(Root);
+        if (!point.Properties.IsLeftButtonPressed)
+        {
+            ResetInternalDrag();
+            return;
+        }
+
+        if (!_internalDragStarted &&
+            (Math.Abs(point.Position.X - _internalDragStart.X) > 8 ||
+             Math.Abs(point.Position.Y - _internalDragStart.Y) > 8))
+        {
+            var selected = _internalDragList.SelectedItems
+                .OfType<ExplorerEntry>()
+                .Select(entry => entry.FullPath)
+                .ToArray();
+            _internalDragSources = selected.Contains(_internalDragPath, StringComparer.OrdinalIgnoreCase)
+                ? selected
+                : [_internalDragPath!];
+            _internalDragStarted = true;
+        }
+
+        if (_internalDragStarted)
+            UpdateInternalDragTarget(GetInternalDragTabDestination(point.Position));
+    }
+
+    private async void InternalDrag_PointerReleased(object sender, PointerRoutedEventArgs e)
+    {
+        if (!_internalDragStarted)
+        {
+            ResetInternalDrag();
+            return;
+        }
+
+        var destination = GetInternalDragTabDestination(e.GetCurrentPoint(Root).Position);
+        var sources = _internalDragSources;
+        ResetInternalDrag();
+        e.Handled = true;
+
+        if (destination is null || FileSystemService.IsArchivePath(destination))
+            return;
+
+        try
+        {
+            var copy = await PromptForDropActionAsync(sources);
+            if (copy is null)
+                return;
+
+            foreach (var source in sources)
+            {
+                if (!FileSystemService.IsArchivePath(source) &&
+                    string.Equals(Path.GetDirectoryName(Path.GetFullPath(source)), Path.GetFullPath(destination),
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!await PastePathAsync(source, destination, move: !copy.Value))
+                    return;
+            }
+
+            RefreshDropPanes(sources, destination);
+        }
+        catch (Exception exception)
+        {
+            await ShowMessageAsync("Unable to drop items", exception.Message);
+        }
+    }
+
+    private string? GetInternalDragTabDestination(Windows.Foundation.Point point)
+    {
+        return GetTabDestination(LeftTabs, _leftTabs) ?? GetTabDestination(RightTabs, _rightTabs);
+
+        string? GetTabDestination(StackPanel container, IReadOnlyList<string> tabs)
+        {
+            for (var index = 0; index < tabs.Count && index < container.Children.Count; index++)
+            {
+                if (container.Children[index] is not Button button)
+                    continue;
+
+                var origin = button.TransformToVisual(Root)
+                    .TransformPoint(new Windows.Foundation.Point(0, 0));
+                if (point.X >= origin.X && point.X <= origin.X + button.ActualWidth &&
+                    point.Y >= origin.Y && point.Y <= origin.Y + button.ActualHeight)
+                    return tabs[index];
+            }
+
+            return null;
+        }
+    }
+
+    private void UpdateInternalDragTarget(string? destination)
+    {
+        if (string.Equals(_internalDragDestination, destination, StringComparison.OrdinalIgnoreCase))
+            return;
+
+        if (_internalDragTargetButton is not null)
+            _internalDragTargetButton.Background = _internalDragTargetBackground;
+
+        _internalDragTargetButton = null;
+        _internalDragTargetBackground = null;
+        _internalDragDestination = destination;
+        if (destination is null)
+            return;
+
+        var tabs = _leftTabs.Contains(destination, StringComparer.OrdinalIgnoreCase) ? _leftTabs : _rightTabs;
+        var container = ReferenceEquals(tabs, _leftTabs) ? LeftTabs : RightTabs;
+        var index = tabs.FindIndex(path => string.Equals(path, destination, StringComparison.OrdinalIgnoreCase));
+        if (index < 0 || index >= container.Children.Count ||
+            container.Children[index] is not Button button)
+            return;
+
+        _internalDragTargetButton = button;
+        _internalDragTargetBackground = button.Background;
+        var color = FileSystemService.IsArchivePath(destination)
+            ? Windows.UI.Color.FromArgb(160, 220, 65, 65)
+            : Windows.UI.Color.FromArgb(160, 45, 145, 85);
+        button.Background = new SolidColorBrush(color);
+    }
+
+    private void ResetInternalDrag()
+    {
+        if (_internalDragTargetButton is not null)
+            _internalDragTargetButton.Background = _internalDragTargetBackground;
+        _internalDragTargetButton = null;
+        _internalDragTargetBackground = null;
+        _internalDragList = null;
+        _internalDragPath = null;
+        _internalDragDestination = null;
+        _internalDragSources = [];
+        _internalDragStarted = false;
+    }
+
+    private void ExplorerList_DragOver(object sender, DragEventArgs e)
+    {
+        if (sender is not ListView list || !HasDropData(e.DataView) ||
+            FileSystemService.IsArchivePath(GetListDropDestination(list, e.OriginalSource as DependencyObject)))
+        {
+            e.AcceptedOperation = DataPackageOperation.None;
+            return;
+        }
+
+        e.AcceptedOperation = GetDragOperation(e);
+    }
+
+    private async void ExplorerList_Drop(object sender, DragEventArgs e)
+    {
+        if (sender is not ListView list)
+            return;
+
+        var destination = GetListDropDestination(list, e.OriginalSource as DependencyObject);
+        await ProcessDropAsync(e, destination, promptForAction: false);
+    }
+
+    private void Tab_DragOver(string destination, DragEventArgs e)
+    {
+        e.AcceptedOperation = HasDropData(e.DataView) && !FileSystemService.IsArchivePath(destination)
+            ? DataPackageOperation.Copy | DataPackageOperation.Move
+            : DataPackageOperation.None;
+    }
+
+    private async Task Tab_DropAsync(string destination, DragEventArgs e) =>
+        await ProcessDropAsync(e, destination, promptForAction: true);
+
+    private async Task ProcessDropAsync(DragEventArgs e, string destination, bool promptForAction)
+    {
+        e.Handled = true;
+        if (!HasDropData(e.DataView) || FileSystemService.IsArchivePath(destination))
+            return;
+
+        try
+        {
+            var sources = await GetDropSourcesAsync(e.DataView);
+            if (sources.Length == 0)
+                return;
+
+            var copy = promptForAction
+                ? await PromptForDropActionAsync(sources)
+                : GetDragOperation(e) == DataPackageOperation.Copy;
+            if (copy is null)
+                return;
+
+            foreach (var source in sources)
+            {
+                if (!FileSystemService.IsArchivePath(source) &&
+                    string.Equals(Path.GetDirectoryName(Path.GetFullPath(source)), Path.GetFullPath(destination),
+                        StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!await PastePathAsync(source, destination, move: !copy.Value))
+                    return;
+            }
+
+            RefreshDropPanes(sources, destination);
+        }
+        catch (Exception exception)
+        {
+            await ShowMessageAsync("Unable to drop items", exception.Message);
+        }
+    }
+
+    private static bool HasDropData(DataPackageView data) =>
+        data.AvailableFormats.Contains(InternalDragFormat) ||
+        data.AvailableFormats.Contains(StandardDataFormats.StorageItems);
+
+    private static DataPackageOperation GetDragOperation(DragEventArgs e)
+    {
+        if (e.Modifiers.HasFlag(DragDropModifiers.Control))
+            return DataPackageOperation.Copy;
+
+        var requested = e.DataView.RequestedOperation;
+        return (requested & DataPackageOperation.Move) != 0
+            ? DataPackageOperation.Move
+            : DataPackageOperation.Copy;
+    }
+
+    private string GetListDropDestination(ListView list, DependencyObject? source)
+    {
+        while (source is not null && source is not ListViewItem)
+        {
+            if (source is not UIElement element)
+                break;
+            source = VisualTreeHelper.GetParent(element);
+        }
+
+        var entry = source is ListViewItem item
+            ? item.DataContext as ExplorerEntry ?? item.Content as ExplorerEntry
+            : null;
+        return entry is { IsDirectory: true } ? entry.FullPath :
+            ReferenceEquals(list, LeftList) ? _leftTabs[_leftTabIndex] : _rightTabs[_rightTabIndex];
+    }
+
+    private static async Task<string[]> GetDropSourcesAsync(DataPackageView data)
+    {
+        if (data.AvailableFormats.Contains(InternalDragFormat))
+        {
+            var payload = await data.GetDataAsync(InternalDragFormat);
+            if (payload is not string json)
+                throw new InvalidDataException("The dragged Explorer++ item list is invalid.");
+            return JsonSerializer.Deserialize<string[]>(json) ??
+                throw new InvalidDataException("The dragged Explorer++ item list is invalid.");
+        }
+
+        var items = await data.GetStorageItemsAsync();
+        return items.Select(item => item.Path).Where(path => !string.IsNullOrWhiteSpace(path)).ToArray();
+    }
+
+    private async Task<bool?> PromptForDropActionAsync(IReadOnlyCollection<string> sources)
+    {
+        var archiveSource = sources.Any(FileSystemService.IsArchivePath);
+        var dialog = new ContentDialog
+        {
+            Title = "Drop items",
+            PrimaryButtonText = archiveSource ? "Copy here" : "Move here",
+            CloseButtonText = "Cancel",
+            DefaultButton = ContentDialogButton.Primary,
+            XamlRoot = Root.XamlRoot
+        };
+        if (archiveSource)
+            dialog.Content = "Items from archives can only be copied.";
+        else
+        {
+            dialog.Content = "What would you like to do with these items?";
+            dialog.SecondaryButtonText = "Copy here";
+        }
+
+        var result = await dialog.ShowAsync();
+        if (result == ContentDialogResult.Primary)
+            return archiveSource;
+        if (result == ContentDialogResult.Secondary && !archiveSource)
+            return true;
+        return null;
+    }
+
+    private void RefreshDropPanes(IEnumerable<string> sources, string destination)
+    {
+        var sourcePaths = sources
+            .Where(source => !FileSystemService.IsArchivePath(source))
+            .Select(source => Path.GetDirectoryName(Path.GetFullPath(source)))
+            .ToArray();
+
+        if (_leftPaneOpen && (string.Equals(_leftTabs[_leftTabIndex], destination, StringComparison.OrdinalIgnoreCase) ||
+            sourcePaths.Contains(_leftTabs[_leftTabIndex], StringComparer.OrdinalIgnoreCase)))
+            LoadPane(true);
+        if (_rightPaneOpen && (string.Equals(_rightTabs[_rightTabIndex], destination, StringComparison.OrdinalIgnoreCase) ||
+            sourcePaths.Contains(_rightTabs[_rightTabIndex], StringComparer.OrdinalIgnoreCase)))
+            LoadPane(false);
+    }
+
     private void SetClipboard(bool cut)
     {
         SetClipboardForSelection(cut);
@@ -3609,6 +4667,519 @@ public sealed partial class MainWindow : Window
         _clipboardPath = string.Join(Environment.NewLine, selected.Select(entry => entry.FullPath));
         _clipboardIsCut = cut;
         StatusText.Text = $"{(cut ? "Cut" : "Copied")} {selected.Length} item(s).";
+        _ = RecordSelectedClipboardReferencesAsync(selected);
+    }
+
+    private ClipboardHistoryService GetClipboardHistory()
+        => _clipboardHistory ??= new ClipboardHistoryService(_settings.ClipboardHistoryDirectory);
+
+    private async Task RecordSelectedClipboardReferencesAsync(IReadOnlyCollection<ExplorerEntry> entries)
+    {
+        await _clipboardHistoryCaptureGate.WaitAsync();
+        try
+        {
+            var items = entries.Select(entry =>
+                (entry.FullPath, entry.Name, entry.IsDirectory)).ToArray();
+            await GetClipboardHistory().AddPathReferencesAsync(items);
+        }
+        catch (Exception exception)
+        {
+            StatusText.Text = $"Could not save clipboard history: {exception.Message}";
+            Debug.WriteLine(StatusText.Text);
+        }
+        finally
+        {
+            _clipboardHistoryCaptureGate.Release();
+        }
+    }
+
+    private async void WindowsClipboardChanged(IReadOnlyList<WindowsClipboardFormat> formats)
+    {
+        _clipboardPath = null;
+        _clipboardIsCut = false;
+        if (formats.Count == 0)
+        {
+            StatusText.Text = "Windows clipboard changed, but it contains no readable binary clipboard formats.";
+            return;
+        }
+
+        await _clipboardHistoryCaptureGate.WaitAsync();
+        try
+        {
+            var history = GetClipboardHistory();
+            foreach (var format in formats)
+            {
+                history.AddNativeFormat(format);
+                if (format.StoragePaths.Count > 0)
+                {
+                    var pathReferences = format.StoragePaths.Select(path =>
+                        (path, Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)),
+                            Directory.Exists(path))).ToArray();
+                    await history.AddPathReferencesAsync(pathReferences);
+                }
+            }
+            StatusText.Text = $"Windows clipboard history: {history.Entries.Count} item(s), " +
+                $"{ClipboardHistoryEntry.FormatBytes(history.StoredBytes)} stored.";
+        }
+        catch (Exception exception)
+        {
+            StatusText.Text = $"Could not save Windows clipboard history: {exception.Message}";
+            Debug.WriteLine(StatusText.Text);
+        }
+        finally
+        {
+            _clipboardHistoryCaptureGate.Release();
+        }
+    }
+
+    private async void ClipboardHistoryButton_Click(object sender, RoutedEventArgs e)
+        => await ShowClipboardHistoryAsync();
+
+    private async Task ShowClipboardHistoryAsync()
+    {
+        while (true)
+        {
+            ClipboardHistoryService history;
+            try
+            {
+                history = GetClipboardHistory();
+            }
+            catch (Exception exception)
+            {
+                await ShowMessageAsync("Unable to open clipboard history", exception.Message);
+                return;
+            }
+
+            var entries = history.Entries.OrderByDescending(entry => entry.CapturedAt).ToArray();
+            var list = new ListView
+            {
+                SelectionMode = ListViewSelectionMode.Single,
+                Height = 360
+            };
+            foreach (var entry in entries)
+                list.Items.Add(await CreateClipboardHistoryRowAsync(history, entry));
+            var summary = new TextBlock
+            {
+                Text = $"Stored: {ClipboardHistoryEntry.FormatBytes(history.StoredBytes)} / " +
+                    $"{ClipboardHistoryEntry.FormatBytes(ClipboardHistoryService.MaximumHistoryBytes)} " +
+                    $"({entries.Length} entries)\nHistory folder: {history.DirectoryPath}\n" +
+                    "Each entry is one Windows clipboard format; unknown formats are kept as raw blobs. " +
+                    "File and folder entries retain source paths, not copies of their contents.",
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8)
+            };
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Spacing = 8,
+                HorizontalAlignment = HorizontalAlignment.Right
+            };
+            var setCurrentButton = new Button { Content = "Select current" };
+            var deleteButton = new Button { Content = "Delete selected" };
+            var deleteAllButton = new Button { Content = "Delete all" };
+            var refreshButton = new Button { Content = "Refresh" };
+            buttons.Children.Add(setCurrentButton);
+            buttons.Children.Add(deleteButton);
+            buttons.Children.Add(deleteAllButton);
+            buttons.Children.Add(refreshButton);
+            var content = new StackPanel { Spacing = 8 };
+            content.Children.Add(summary);
+            content.Children.Add(list);
+            content.Children.Add(buttons);
+            var dialog = new ContentDialog
+            {
+                Title = "Clipboard history",
+                Content = content,
+                CloseButtonText = "Close",
+                DefaultButton = ContentDialogButton.Close,
+                XamlRoot = Root.XamlRoot
+            };
+            var action = "";
+            ClipboardHistoryEntry? selected = null;
+            setCurrentButton.Click += (_, _) =>
+            {
+                selected = (list.SelectedItem as ListViewItem)?.Tag as ClipboardHistoryEntry;
+                if (selected is not null)
+                {
+                    action = "current";
+                    dialog.Hide();
+                }
+            };
+            deleteButton.Click += (_, _) =>
+            {
+                selected = (list.SelectedItem as ListViewItem)?.Tag as ClipboardHistoryEntry;
+                if (selected is not null)
+                {
+                    action = "delete";
+                    dialog.Hide();
+                }
+            };
+            deleteAllButton.Click += (_, _) =>
+            {
+                action = "clear";
+                dialog.Hide();
+            };
+            refreshButton.Click += (_, _) =>
+            {
+                action = "refresh";
+                dialog.Hide();
+            };
+
+            await dialog.ShowAsync();
+            try
+            {
+                if (action == "current" && selected is not null)
+                {
+                    await SetClipboardFromHistoryAsync(history, selected);
+                    return;
+                }
+                if (action == "delete" && selected is not null)
+                    history.Delete(selected);
+                else if (action == "clear")
+                {
+                    var confirm = new ContentDialog
+                    {
+                        Title = "Delete all clipboard history?",
+                        Content = "This permanently removes all saved clipboard content and history entries.",
+                        PrimaryButtonText = "Delete all",
+                        CloseButtonText = "Cancel",
+                        DefaultButton = ContentDialogButton.Close,
+                        XamlRoot = Root.XamlRoot
+                    };
+                    if (await confirm.ShowAsync() == ContentDialogResult.Primary)
+                        history.Clear();
+                }
+                else if (action is not "refresh")
+                    return;
+            }
+            catch (Exception exception)
+            {
+                await ShowMessageAsync("Clipboard history action failed", exception.Message);
+                return;
+            }
+        }
+    }
+
+    private async Task<ListViewItem> CreateClipboardHistoryRowAsync(
+        ClipboardHistoryService history,
+        ClipboardHistoryEntry entry)
+    {
+        var content = new StackPanel { Padding = new Thickness(8, 6, 8, 6), Spacing = 3 };
+        content.Children.Add(new TextBlock
+        {
+            Text = entry.DisplayName,
+            FontWeight = Microsoft.UI.Text.FontWeights.SemiBold,
+            TextTrimming = Microsoft.UI.Xaml.TextTrimming.CharacterEllipsis
+        });
+        content.Children.Add(new TextBlock
+        {
+            Text = entry.Details,
+            Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 170, 180, 194)),
+            TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap
+        });
+
+        if (!string.IsNullOrWhiteSpace(entry.SourcePath))
+        {
+            content.Children.Add(new TextBlock
+            {
+                Text = entry.SourcePath,
+                FontSize = 9,
+                Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 150, 161, 177)),
+                TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                IsTextSelectionEnabled = true
+            });
+        }
+
+        if (entry.PayloadFileName is not null)
+        {
+            var bytes = history.ReadPayload(entry);
+            if (entry.Kind == "Image")
+            {
+                var pngBytes = TryCreateClipboardImagePreview(bytes, entry.ClipboardFormatId);
+                if (pngBytes is not null)
+                {
+                    var image = await CreateBitmapSourceAsync(pngBytes);
+                    content.Children.Add(new Image
+                    {
+                        Source = image,
+                        MaxWidth = 240,
+                        MaxHeight = 120,
+                        Stretch = Microsoft.UI.Xaml.Media.Stretch.Uniform,
+                        HorizontalAlignment = HorizontalAlignment.Left
+                    });
+                }
+            }
+            else if (entry.Kind is "Text" or "HTML" or "Rich text")
+            {
+                var preview = DecodeClipboardTextPreview(bytes, entry);
+                if (!string.IsNullOrWhiteSpace(preview))
+                {
+                    content.Children.Add(new TextBlock
+                    {
+                        Text = preview,
+                        MaxHeight = 90,
+                        TextWrapping = Microsoft.UI.Xaml.TextWrapping.Wrap,
+                        TextTrimming = Microsoft.UI.Xaml.TextTrimming.CharacterEllipsis,
+                        Foreground = new SolidColorBrush(Windows.UI.Color.FromArgb(255, 221, 229, 239)),
+                        FontFamily = new Microsoft.UI.Xaml.Media.FontFamily("Segoe UI")
+                    });
+                }
+            }
+        }
+
+        return new ListViewItem { Content = content, Tag = entry };
+    }
+
+    private static string DecodeClipboardTextPreview(byte[] bytes, ClipboardHistoryEntry entry)
+    {
+        var text = entry.ClipboardFormatId switch
+        {
+            13 => Encoding.Unicode.GetString(bytes),
+            1 or 7 => Encoding.Latin1.GetString(bytes),
+            _ => Encoding.UTF8.GetString(bytes)
+        };
+        text = text.TrimEnd('\0').Trim();
+        if (entry.Kind == "HTML")
+        {
+            var start = text.IndexOf("<html", StringComparison.OrdinalIgnoreCase);
+            var end = text.LastIndexOf("</html>", StringComparison.OrdinalIgnoreCase);
+            if (start >= 0 && end >= start)
+                text = text[start..(end + "</html>".Length)];
+        }
+        return text.Length <= 800 ? text : text[..800] + "…";
+    }
+
+    private static byte[]? TryCreateClipboardImagePreview(byte[] bytes, uint? formatId)
+    {
+        try
+        {
+            using var input = new MemoryStream(bytes, writable: false);
+            using var image = SixLabors.ImageSharp.Image.Load<Rgba32>(input);
+            using var output = new MemoryStream();
+            image.Save(output, new PngEncoder());
+            return output.ToArray();
+        }
+        catch (Exception exception) when (exception is SixLabors.ImageSharp.ImageFormatException or
+            ArgumentException or InvalidDataException)
+        {
+            if (formatId is not (8 or 17) || bytes.Length < 40)
+                return null;
+
+            var headerSize = BitConverter.ToUInt32(bytes, 0);
+            if (headerSize < 40 || headerSize > bytes.Length)
+                return null;
+            var bitCount = BitConverter.ToUInt16(bytes, 14);
+            var colorsUsed = BitConverter.ToUInt32(bytes, 32);
+            var paletteEntries = colorsUsed > 0 ? colorsUsed : bitCount <= 8 ? 1u << bitCount : 0;
+            var pixelOffset = 14L + headerSize + paletteEntries * 4L;
+            if (pixelOffset > int.MaxValue || pixelOffset > 14L + bytes.Length)
+                return null;
+
+            var bmp = new byte[14 + bytes.Length];
+            bmp[0] = (byte)'B';
+            bmp[1] = (byte)'M';
+            BitConverter.GetBytes(bmp.Length).CopyTo(bmp, 2);
+            BitConverter.GetBytes((int)pixelOffset).CopyTo(bmp, 10);
+            bytes.CopyTo(bmp, 14);
+            using var dibStream = new MemoryStream(bmp, writable: false);
+            using var dibImage = SixLabors.ImageSharp.Image.Load<Rgba32>(dibStream);
+            using var pngStream = new MemoryStream();
+            dibImage.Save(pngStream, new PngEncoder());
+            return pngStream.ToArray();
+        }
+        catch (Exception exception) when (exception is SixLabors.ImageSharp.ImageFormatException or
+            ArgumentException or InvalidDataException or OverflowException)
+        {
+            return null;
+        }
+    }
+
+    private async Task SetClipboardFromHistoryAsync(
+        ClipboardHistoryService history,
+        ClipboardHistoryEntry entry)
+    {
+        if (entry.ClipboardFormatId is uint formatId && entry.ClipboardFormatName is string formatName)
+        {
+            WindowsClipboardMonitor.SetClipboardFormat(
+                WindowNative.GetWindowHandle(this),
+                formatId,
+                formatName,
+                history.ReadPayload(entry));
+            StatusText.Text = $"Restored Windows clipboard format {formatName}.";
+            return;
+        }
+
+        var package = new DataPackage();
+        switch (entry.Kind)
+        {
+            case "Image":
+            {
+                var payloadPath = Path.Combine(history.DirectoryPath, entry.PayloadFileName!);
+                var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(payloadPath);
+                package.SetBitmap(Windows.Storage.Streams.RandomAccessStreamReference.CreateFromFile(file));
+                break;
+            }
+            case "HTML":
+                package.SetHtmlFormat(HtmlFormatHelper.CreateHtmlFormat(
+                    Encoding.UTF8.GetString(history.ReadPayload(entry))));
+                break;
+            case "Rich text":
+                package.SetRtf(Encoding.UTF8.GetString(history.ReadPayload(entry)));
+                break;
+            case "Text":
+                package.SetText(Encoding.UTF8.GetString(history.ReadPayload(entry)));
+                break;
+            case "File reference":
+            {
+                var file = await Windows.Storage.StorageFile.GetFileFromPathAsync(entry.SourcePath!);
+                package.SetStorageItems([file], readOnly: true);
+                break;
+            }
+            case "Folder reference":
+            {
+                var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(entry.SourcePath!);
+                package.SetStorageItems([folder], readOnly: true);
+                break;
+            }
+            default:
+                throw new InvalidOperationException($"Clipboard history type '{entry.Kind}' is not supported.");
+        }
+
+        Clipboard.SetContent(package);
+        Clipboard.Flush();
+        StatusText.Text = $"Set clipboard to {entry.DisplayName}.";
+    }
+
+    private async Task ConvertSelectedImagesToPngAsync(IReadOnlyCollection<ExplorerEntry> entries)
+    {
+        var candidates = entries
+            .Where(entry => !entry.IsDirectory && !entry.IsArchiveEntry && IsImage(entry.Name) &&
+                !Path.GetExtension(entry.Name).Equals(".png", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            await ShowMessageAsync("No convertible images selected",
+                "Select one or more supported non-PNG image files in a regular folder.");
+            return;
+        }
+
+        var converted = new List<string>();
+        var errors = new List<string>();
+        foreach (var entry in candidates)
+        {
+            IReadOnlyList<DecodedTextureImage>? images;
+            try
+            {
+                images = await AccessRetryService.RunAsync(Root.XamlRoot, entry.FullPath,
+                    () => PreviewFormatRegistry.DecodeImagesOriginal(entry.FullPath));
+                if (images is null)
+                {
+                    errors.Add($"{entry.Name}: File access was cancelled.");
+                    continue;
+                }
+            }
+            catch (Exception exception)
+            {
+                errors.Add($"{entry.Name}: {exception.Message}");
+                continue;
+            }
+
+            foreach (var image in images)
+            {
+                var outputName = image.Name is null ? entry.Name : $"{entry.Name} ({image.Name})";
+                try
+                {
+                    var targetPath = GetAvailablePngPath(entry.FullPath, image.Name);
+                    var saved = await AccessRetryService.RunActionAsync(Root.XamlRoot, targetPath,
+                        () => WriteNewFile(targetPath, image.PngBytes));
+                    if (!saved)
+                    {
+                        errors.Add($"{outputName}: File access was cancelled.");
+                        continue;
+                    }
+                    converted.Add(Path.GetFileName(targetPath));
+                }
+                catch (Exception exception)
+                {
+                    errors.Add($"{outputName}: {exception.Message}");
+                }
+            }
+        }
+
+        StatusText.Text = $"Created {converted.Count} PNG file(s) from {candidates.Length} selected image file(s).";
+        var details = converted.Count > 0
+            ? $"Created {converted.Count} PNG file(s):\n{string.Join("\n", converted.Take(8))}" +
+              (converted.Count > 8 ? "\n…" : "")
+            : "No files were converted.";
+        if (errors.Count > 0)
+            details += $"\n\nCould not convert {errors.Count} item(s):\n{string.Join("\n", errors.Take(8))}" +
+                       (errors.Count > 8 ? "\n…" : "");
+        if (converted.Count > 0)
+            LoadPane(_leftActive);
+        await ShowMessageAsync("Image conversion complete", details);
+    }
+
+    private static string GetAvailablePngPath(string sourcePath, string? textureName = null)
+    {
+        var sourceName = Path.GetFileNameWithoutExtension(sourcePath);
+        var outputName = textureName is null ? sourceName : $"{sourceName}_{SanitizeFileName(textureName)}";
+        var directory = Path.GetDirectoryName(sourcePath)!;
+        var target = Path.Combine(directory, $"{outputName}.png");
+        if (!File.Exists(target) && !Directory.Exists(target))
+            return target;
+
+        for (var suffix = 1; ; suffix++)
+        {
+            var convertedName = suffix == 1
+                ? $"{outputName} (converted).png"
+                : $"{outputName} (converted {suffix}).png";
+            target = Path.Combine(directory, convertedName);
+            if (!File.Exists(target) && !Directory.Exists(target))
+                return target;
+        }
+    }
+
+    private static string SanitizeFileName(string name)
+    {
+        var invalidCharacters = Path.GetInvalidFileNameChars();
+        var sanitized = new string(name
+            .Select(character => invalidCharacters.Contains(character) || character is '/' or '\\' ? '_' : character)
+            .ToArray())
+            .Trim(' ', '.');
+        return string.IsNullOrEmpty(sanitized) ? "texture" : sanitized;
+    }
+
+    private static void WriteNewFile(string path, byte[] contents)
+    {
+        if (FileSystemService.IsRemotePath(path))
+        {
+            using var input = new MemoryStream(contents, writable: false);
+            RemoteFileSystemService.WriteFile(path, input);
+            return;
+        }
+
+        var created = false;
+        try
+        {
+            using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            created = true;
+            stream.Write(contents);
+        }
+        catch (Exception writeException)
+        {
+            if (!created)
+                throw;
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception cleanupException)
+            {
+                throw new IOException($"Could not remove incomplete output file '{path}'.",
+                    new AggregateException(writeException, cleanupException));
+            }
+            throw;
+        }
     }
 
     private async void PasteButton_Click(object sender, RoutedEventArgs e)
@@ -3638,18 +5209,52 @@ public sealed partial class MainWindow : Window
             else
             {
                 var clipboard = Clipboard.GetContent();
-                if (!clipboard.Contains(StandardDataFormats.StorageItems))
-                    return;
-                var items = await clipboard.GetStorageItemsAsync();
-                var move = (clipboard.RequestedOperation & DataPackageOperation.Move) != 0;
-                foreach (var item in items)
+                if (clipboard.Contains(StandardDataFormats.StorageItems))
                 {
-                    if (string.IsNullOrWhiteSpace(item.Path))
-                        continue;
-                    var succeeded = await PastePathAsync(item.Path, destinationPath, move);
-                    if (!succeeded)
-                        return;
+                    var items = await clipboard.GetStorageItemsAsync();
+                    var move = (clipboard.RequestedOperation & DataPackageOperation.Move) != 0;
+                    foreach (var item in items)
+                    {
+                        if (string.IsNullOrWhiteSpace(item.Path))
+                            continue;
+                        var succeeded = await PastePathAsync(item.Path, destinationPath, move);
+                        if (!succeeded)
+                            return;
+                    }
                 }
+                else if (clipboard.Contains(StandardDataFormats.Bitmap))
+                {
+                    var bitmap = await clipboard.GetBitmapAsync();
+                    using var clipboardStream = await bitmap.OpenReadAsync();
+                    using var imageStream = clipboardStream.AsStreamForRead();
+                    using var image = await SixLabors.ImageSharp.Image.LoadAsync<Rgba32>(imageStream);
+                    await using var pngStream = new MemoryStream();
+                    await image.SaveAsync(pngStream, new PngEncoder());
+                    var outputPath = GetAvailableClipboardPath(destinationPath, "clipboardImage", ".png");
+                    WriteNewFile(outputPath, pngStream.ToArray());
+                }
+                else if (clipboard.Contains(StandardDataFormats.Html))
+                {
+                    var html = await clipboard.GetHtmlFormatAsync();
+                    var fragment = HtmlFormatHelper.GetStaticFragment(html);
+                    var document = $"<!doctype html><html><head><meta charset=\"utf-8\"></head><body>{fragment}</body></html>";
+                    var outputPath = GetAvailableClipboardPath(destinationPath, "clipboardHtml", ".html");
+                    WriteNewFile(outputPath, Encoding.UTF8.GetBytes(document));
+                }
+                else if (clipboard.Contains(StandardDataFormats.Rtf))
+                {
+                    var rtf = await clipboard.GetRtfAsync();
+                    var outputPath = GetAvailableClipboardPath(destinationPath, "clipboardRichText", ".rtf");
+                    WriteNewFile(outputPath, Encoding.UTF8.GetBytes(rtf));
+                }
+                else if (clipboard.Contains(StandardDataFormats.Text))
+                {
+                    var text = await clipboard.GetTextAsync();
+                    var outputPath = GetAvailableClipboardPath(destinationPath, "clipboardText", ".txt");
+                    WriteNewFile(outputPath, Encoding.UTF8.GetBytes(text));
+                }
+                else
+                    return;
             }
             if (string.Equals(destinationPath, CurrentPath, StringComparison.OrdinalIgnoreCase))
                 LoadPane(_leftActive);
@@ -3660,8 +5265,55 @@ public sealed partial class MainWindow : Window
         }
     }
 
+    private static string GetAvailableClipboardPath(string directory, string name, string extension)
+    {
+        var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmssfff", CultureInfo.InvariantCulture);
+        var fileName = $"{name}-{timestamp}{extension}";
+        var path = FileSystemService.CombinePath(directory, fileName);
+        if (!File.Exists(path) && !Directory.Exists(path))
+            return path;
+
+        for (var suffix = 2; ; suffix++)
+        {
+            path = FileSystemService.CombinePath(directory, $"{name}-{timestamp}-{suffix}{extension}");
+            if (!File.Exists(path) && !Directory.Exists(path))
+                return path;
+        }
+    }
+
     private async Task<bool> PastePathAsync(string source, string destinationPath, bool move)
     {
+        if (FileSystemService.IsRemotePath(source) || FileSystemService.IsRemotePath(destinationPath))
+        {
+            var actionPath = FileSystemService.IsRemotePath(destinationPath) ? destinationPath : source;
+            return await AccessRetryService.RunActionAsync(Root.XamlRoot, actionPath, () =>
+            {
+                var remoteSource = FileSystemService.IsRemotePath(source);
+                var remoteDestination = FileSystemService.IsRemotePath(destinationPath);
+                var sourceIsDirectory = remoteSource
+                    ? RemoteFileSystemService.IsDirectory(source)
+                    : Directory.Exists(source);
+
+                if (remoteSource && remoteDestination)
+                    RemoteFileSystemService.CopyRemoteEntry(source, destinationPath, sourceIsDirectory);
+                else if (remoteSource)
+                    RemoteFileSystemService.CopyRemoteEntryToLocal(source, destinationPath, sourceIsDirectory);
+                else if (remoteDestination)
+                    RemoteFileSystemService.CopyLocalEntryToRemote(source, destinationPath);
+                else
+                    RemoteFileSystemService.CopyLocalEntryToLocal(source, destinationPath);
+
+                if (!move)
+                    return;
+                if (remoteSource)
+                    RemoteFileSystemService.Delete(source, sourceIsDirectory);
+                else if (sourceIsDirectory)
+                    Directory.Delete(source, recursive: true);
+                else
+                    File.Delete(source);
+            });
+        }
+
         return await AccessRetryService.RunActionAsync(Root.XamlRoot, source, () =>
         {
             if (FileSystemService.IsArchivePath(source))
@@ -3672,10 +5324,35 @@ public sealed partial class MainWindow : Window
             var destination = Path.Combine(destinationPath, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar)));
             if (move)
             {
-                if (Directory.Exists(source))
-                    Directory.Move(source, destination);
+                var fullSource = Path.GetFullPath(source);
+                var fullDestination = Path.GetFullPath(destination);
+                if (Directory.Exists(source) &&
+                    fullDestination.StartsWith(fullSource.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("A folder cannot be moved into itself or one of its subfolders.");
+
+                var sourceRoot = Path.GetPathRoot(fullSource);
+                var destinationRoot = Path.GetPathRoot(fullDestination);
+                if (string.Equals(sourceRoot, destinationRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (Directory.Exists(source))
+                        Directory.Move(source, destination);
+                    else
+                        File.Move(source, destination);
+                }
                 else
-                    File.Move(source, destination);
+                {
+                    if (Directory.Exists(source))
+                    {
+                        FileSystemService.CopyDirectory(source, destination);
+                        Directory.Delete(source, recursive: true);
+                    }
+                    else
+                    {
+                        File.Copy(source, destination, overwrite: false);
+                        File.Delete(source);
+                    }
+                }
             }
             else
             {
@@ -3702,16 +5379,16 @@ public sealed partial class MainWindow : Window
         var name = await PromptAsync("Rename", "New name", entry.Name);
         if (string.IsNullOrWhiteSpace(name) || name == entry.Name)
             return;
+        if (!IsValidNewItemName(name.Trim()))
+        {
+            await ShowMessageAsync("Invalid name", "Enter a valid file or folder name without a path.");
+            return;
+        }
         try
         {
-            var destination = Path.Combine(CurrentPath, name.Trim());
+            var destination = FileSystemService.CombinePath(CurrentPath, name.Trim());
             if (await AccessRetryService.RunActionAsync(Root.XamlRoot, entry.FullPath, () =>
-                {
-                    if (entry.IsDirectory)
-                        Directory.Move(entry.FullPath, destination);
-                    else
-                        File.Move(entry.FullPath, destination);
-                }))
+                    FileSystemService.Rename(entry.FullPath, destination, entry.IsDirectory)))
                 LoadPane(_leftActive);
         }
         catch (Exception exception)
@@ -3730,16 +5407,21 @@ public sealed partial class MainWindow : Window
             return;
         }
 
-        var operation = permanent ? "permanently delete" : "move to the Recycle Bin";
+        var remoteLocation = FileSystemService.IsRemotePath(CurrentPath);
+        var operation = remoteLocation
+            ? "delete from the server"
+            : permanent
+                ? "permanently delete"
+                : "move to the Recycle Bin";
         var confirm = new ContentDialog
         {
             Title = selected.Count > 1 ? $"Delete {selected.Count} selected items?" : "Delete selected item?",
             Content = selected.Count > 1
                 ? $"This will {operation} all {selected.Count} selected files and folders."
-                : permanent
+                : remoteLocation || permanent
                     ? $"This will permanently delete \"{selected.First().Name}\". This cannot be undone."
                     : $"\"{selected.First().Name}\" will be moved to the Recycle Bin.",
-            PrimaryButtonText = permanent ? "Delete permanently" : "Delete",
+            PrimaryButtonText = remoteLocation || permanent ? "Delete permanently" : "Delete",
             CloseButtonText = "Cancel",
             DefaultButton = ContentDialogButton.Close,
             XamlRoot = Root.XamlRoot
@@ -3751,22 +5433,7 @@ public sealed partial class MainWindow : Window
             foreach (var entry in selected)
             {
                 var deleted = await AccessRetryService.RunActionAsync(Root.XamlRoot, entry.FullPath, () =>
-                {
-                    if (entry.IsDirectory)
-                        Microsoft.VisualBasic.FileIO.FileSystem.DeleteDirectory(
-                            entry.FullPath,
-                            Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                            permanent
-                                ? Microsoft.VisualBasic.FileIO.RecycleOption.DeletePermanently
-                                : Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                    else
-                        Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile(
-                            entry.FullPath,
-                            Microsoft.VisualBasic.FileIO.UIOption.OnlyErrorDialogs,
-                            permanent
-                                ? Microsoft.VisualBasic.FileIO.RecycleOption.DeletePermanently
-                                : Microsoft.VisualBasic.FileIO.RecycleOption.SendToRecycleBin);
-                });
+                    FileSystemService.Delete(entry.FullPath, entry.IsDirectory, permanent || remoteLocation));
                 if (!deleted)
                     return;
             }
@@ -3878,5 +5545,11 @@ public sealed partial class MainWindow : Window
         await dialog.ShowAsync();
     }
 
-    private sealed record QuickLocation(string Name, string Path, string Icon, string? OtherPath = null);
+    private sealed record QuickLocation(
+        string Name,
+        string Path,
+        string Icon,
+        string? OtherPath = null,
+        bool CanRemove = false,
+        int? IconResourceIndex = null);
 }

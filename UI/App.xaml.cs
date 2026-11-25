@@ -1,14 +1,19 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Security.Principal;
 using Microsoft.UI.Xaml;
+using UI.Services;
+using WinRT.Interop;
 
 namespace UI;
 
 public partial class App : Application
 {
+    private const int ShowWindowRestore = 9;
     private Window? _window;
+    private DesktopBackgroundDoubleClickMonitor? _desktopBackgroundMonitor;
     internal static string? StartupNotice { get; private set; }
 
     public App()
@@ -18,15 +23,73 @@ public partial class App : Application
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
-        if (TryRelaunchElevated())
+        var commandLineArguments = Environment.GetCommandLineArgs();
+        if (commandLineArguments.Any(argument =>
+                argument.Equals(DesktopBackgroundDoubleClickMonitor.LaunchArgument, StringComparison.OrdinalIgnoreCase)))
+        {
+            StartDesktopBackgroundMonitor();
+            return;
+        }
+
+        var desktopLaunch = commandLineArguments.Any(argument =>
+            argument.Equals(DesktopBackgroundDoubleClickMonitor.ActivationArgument, StringComparison.OrdinalIgnoreCase));
+        if (desktopLaunch && DesktopBackgroundDoubleClickMonitor.ActivateExistingApplicationWindow())
+        {
+            Environment.Exit(0);
+            return;
+        }
+
+        var settings = ExplorerSettingsService.Load(out var settingsError);
+        var monitorError = DesktopBackgroundDoubleClickMonitor.ApplySetting(
+            settings.DesktopBackgroundDoubleClickLauncherEnabled);
+        StartupNotice = monitorError ?? settingsError;
+
+        if (TryRelaunchElevated(desktopLaunch))
             return;
 
         _window = new MainWindow(GetOpenPathArgument());
         _window.Activate();
+        if (desktopLaunch)
+        {
+            var windowHandle = WindowNative.GetWindowHandle(_window);
+            ShowWindow(windowHandle, ShowWindowRestore);
+            SetForegroundWindow(windowHandle);
+        }
     }
 
-    private static bool TryRelaunchElevated()
+    private void StartDesktopBackgroundMonitor()
     {
+        try
+        {
+            var executablePath = Environment.ProcessPath
+                ?? throw new InvalidOperationException("The application executable path is unavailable.");
+            _desktopBackgroundMonitor = DesktopBackgroundDoubleClickMonitor.Start(executablePath);
+            if (_desktopBackgroundMonitor is null)
+            {
+                Environment.Exit(0);
+                return;
+            }
+
+            _window = new Window { Title = DesktopBackgroundDoubleClickMonitor.WindowTitle };
+            _window.Closed += (_, _) => _desktopBackgroundMonitor?.Dispose();
+            _window.Activate();
+            DesktopBackgroundDoubleClickMonitor.HideWindow(WindowNative.GetWindowHandle(_window));
+        }
+        catch (Exception exception) when (exception is Win32Exception or InvalidOperationException or
+                                           UnauthorizedAccessException or System.Security.SecurityException or ArgumentException or
+                                           System.Runtime.InteropServices.COMException)
+        {
+            MessageBox(IntPtr.Zero, exception.Message, "ExplorerPlusPlus desktop monitor", 0x10);
+            Environment.Exit(1);
+        }
+    }
+
+    private static bool TryRelaunchElevated(bool desktopLaunch)
+    {
+        //Check for Alt key to bypass Admin Elevate
+        if ((GetAsyncKeyState(0x12) & 0x8000) != 0)
+            return false;
+
         if (Environment.GetCommandLineArgs().Any(argument => argument.Equals("--elevated", StringComparison.OrdinalIgnoreCase)))
             return false;
 
@@ -44,7 +107,7 @@ public partial class App : Application
 
         try
         {
-            var startInfo = CreateElevatedStartInfo();
+            var startInfo = CreateElevatedStartInfo(desktopLaunch: desktopLaunch);
             if (Process.Start(startInfo) is null)
                 throw new InvalidOperationException("Windows did not start the elevated application.");
 
@@ -79,7 +142,7 @@ public partial class App : Application
         }
     }
 
-    private static ProcessStartInfo CreateElevatedStartInfo(string? openPath = null)
+    private static ProcessStartInfo CreateElevatedStartInfo(string? openPath = null, bool desktopLaunch = false)
     {
         var executable = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(executable))
@@ -100,6 +163,8 @@ public partial class App : Application
             startInfo.ArgumentList.Add(assembly);
         }
         startInfo.ArgumentList.Add("--elevated");
+        if (desktopLaunch)
+            startInfo.ArgumentList.Add(DesktopBackgroundDoubleClickMonitor.ActivationArgument);
         if (!string.IsNullOrWhiteSpace(openPath))
         {
             startInfo.ArgumentList.Add("--open");
@@ -118,4 +183,16 @@ public partial class App : Application
         }
         return null;
     }
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int virtualKey);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int MessageBox(IntPtr window, string text, string caption, uint type);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr window, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr window);
 }

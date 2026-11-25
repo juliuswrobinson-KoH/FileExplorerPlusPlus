@@ -6,15 +6,18 @@ public sealed class ExplorerSettings
 {
     public string ItemFontFamily { get; set; } = "Segoe UI";
     public double ItemFontSize { get; set; } = 11;
+    public double FileIconSize { get; set; } = 16;
     public string ItemFontColor { get; set; } = "#FFE8EDF4";
     public bool UseAcrylicBackground { get; set; } = true;
     public string BackgroundTintColor { get; set; } = "#FF191D23";
     public double BackgroundTintOpacity { get; set; } = 0.8;
     public double BackgroundLuminosityOpacity { get; set; } = 0.8;
     public string BackgroundFallbackColor { get; set; } = "#FF191D23";
+    public bool DesktopBackgroundDoubleClickLauncherEnabled { get; set; } = true;
     public List<string> Bookmarks { get; set; } = [];
     public List<string> RecentLocations { get; set; } = [];
     public List<SavedFolderSet> FolderSets { get; set; } = [];
+    public string ClipboardHistoryDirectory { get; set; } = "";
     public ExplorerSessionState Session { get; set; } = new();
 }
 
@@ -98,6 +101,11 @@ public static class ExplorerSettingsService
             {
                 settings.ItemFontSize = 11;
                 error = "The saved item font size was invalid; using 11 pixels.";
+            }
+            if (!double.IsFinite(settings.FileIconSize) || settings.FileIconSize is < 8 or > 64)
+            {
+                settings.FileIconSize = 16;
+                error = "The saved file icon size was invalid; using 16 pixels.";
             }
             if (!IsValidColor(settings.ItemFontColor))
             {

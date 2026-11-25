@@ -6,6 +6,7 @@
     PrimaryButtonText="Reset camera"
     CloseButtonText="Close">
     <Grid Width="1000" Height="650">
+        <!-- 3D scene viewport, lights, and imported model content. -->
         <hx:Viewport3DX x:Name="Viewport"
                         BackgroundColor="#20252D"
                         CameraMode="Inspect"
@@ -15,6 +16,7 @@
             <hx:DirectionalLight3D Direction="-1,-1,-1" Color="White"/>
             <hx:Element3DPresenter x:Name="ScenePresenter"/>
         </hx:Viewport3DX>
+        <!-- On-screen mouse and camera interaction hints. -->
         <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="12"
                 Background="#CC171A20" CornerRadius="4" Padding="8">
             <TextBlock Text="Drag to orbit · scroll to zoom · right-drag to pan"
